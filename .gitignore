@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# Per-cycle strategy state and logs (generated at runtime, not source)
+*_state.json
+*_state_sensex.json
+*_log.txt
+*_log_sensex.txt
+strategy_state.json
+strategy_log.txt
+
+# Local environment / credentials -- never commit these
+.env
+.kite_session.json
