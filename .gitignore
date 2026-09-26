@@ -1,11 +1,11 @@
 __pycache__/
 *.pyc
 
-# Per-cycle strategy state and logs (generated at runtime, not source)
-*_state.json
-*_state_sensex.json
-*_log.txt
-*_log_sensex.txt
+# Per-cycle strategy state and logs (generated at runtime, not source).
+# Covers every broker-scoped variant too (e.g. strategy_state_jainam.json,
+# via _broker_scoped_filename in each strategy script).
+*_state*.json
+*_log*.txt
 strategy_state.json
 strategy_log.txt
 

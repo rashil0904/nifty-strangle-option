@@ -114,6 +114,14 @@ except ImportError as exc:  # pragma: no cover
         "kiteconnect is not installed. Install it with `pip install kiteconnect`."
     ) from exc
 
+# broker_errors.py / broker_client.py live in ../../common relative to this
+# file (shared with Nifty and every strategy script) -- not on the default
+# import path when this module is run standalone, so add it explicitly.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "common"))
+
+from broker_errors import BrokerAuthError, BrokerError
+from broker_client import get_broker_client
+
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
@@ -214,6 +222,12 @@ def fetch_instruments(kite: KiteConnect, exchange: str = BFO_EXCHANGE, use_cache
         raise RuntimeError(f"Network error contacting Kite while fetching instruments: {exc}") from exc
     except KiteException as exc:
         raise RuntimeError(f"Kite API error while fetching instruments: {exc}") from exc
+    except BrokerAuthError as exc:
+        raise RuntimeError(
+            "Jainam credentials expired or invalid while fetching instruments. Regenerate them and retry."
+        ) from exc
+    except BrokerError as exc:
+        raise RuntimeError(f"Jainam API error while fetching instruments: {exc}") from exc
 
     df = pd.DataFrame(raw)
     if df.empty:
@@ -345,6 +359,10 @@ def fetch_option_chain_quotes(kite: KiteConnect, chain_instruments: pd.DataFrame
             raise RuntimeError(f"Kite rejected the option quote request: {exc}") from exc
         except KiteException as exc:
             raise RuntimeError(f"Kite API error fetching option quotes: {exc}") from exc
+        except BrokerAuthError as exc:
+            raise RuntimeError("Jainam credentials expired or invalid while fetching option quotes.") from exc
+        except BrokerError as exc:
+            raise RuntimeError(f"Jainam API error fetching option quotes: {exc}") from exc
 
     rows = []
     for _, inst in chain_instruments.iterrows():
@@ -382,6 +400,10 @@ def fetch_spot_and_futures(kite: KiteConnect, futures_tradingsymbol: str) -> tup
         raise RuntimeError(f"Network error fetching spot/futures quote: {exc}") from exc
     except KiteException as exc:
         raise RuntimeError(f"Kite API error fetching spot/futures quote: {exc}") from exc
+    except BrokerAuthError as exc:
+        raise RuntimeError("Jainam credentials expired or invalid while fetching spot/futures quote.") from exc
+    except BrokerError as exc:
+        raise RuntimeError(f"Jainam API error fetching spot/futures quote: {exc}") from exc
 
     if SENSEX_SPOT_SYMBOL not in result or fut_key not in result:
         raise RuntimeError("Kite did not return both spot and futures quotes; response was incomplete.")
@@ -641,6 +663,7 @@ def run(
     q: float,
     days_per_year: float = DAYS_PER_YEAR,
     futures_expiry: Optional[date] = None,
+    broker: str = "kite",
 ) -> pd.DataFrame:
     """Run the model for one or more expiries. Prints results to the console only.
 
@@ -658,8 +681,16 @@ def run(
     futures_expiry, if given, pins the exact SENSEX futures contract used for
     F (applies to every expiry in expiry_dates) instead of auto-selecting
     the nearest unexpired one.
+
+    broker: "kite" (default) or "jainam" -- see common/broker_client.py.
+    With broker="jainam", only the nearest option expiry is ever resolvable
+    (see common/jainam_client.py's module docstring, including the
+    CONFIRM BEFORE LIVE note on BSE segment IDs); passing multiple or
+    non-nearest --expiry-date values will raise the same "no instruments
+    found for expiry" error the Kite path raises for a genuinely delisted
+    expiry.
     """
-    kite = get_kite_client()
+    kite = get_broker_client(broker, get_kite_client)
 
     logger.info("Fetching BFO instrument master...")
     instruments = fetch_instruments(kite)
@@ -756,13 +787,27 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         default=0.013,
         help="Dividend yield for the spot-based Black-Scholes leg, annualized decimal (default: 0.013 = 1.3%%).",
     )
+    parser.add_argument(
+        "--broker",
+        choices=("kite", "jainam"),
+        default="kite",
+        help="Which broker to fetch data from. Default: kite. --broker jainam uses "
+        "common/jainam_client.py (JAINAM_* environment variables) and only resolves the "
+        "nearest option expiry -- see its module docstring.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
     try:
-        run(expiry_dates=args.expiry_dates, r=args.r, q=args.q, futures_expiry=args.futures_expiry)
+        run(
+            expiry_dates=args.expiry_dates,
+            r=args.r,
+            q=args.q,
+            futures_expiry=args.futures_expiry,
+            broker=args.broker,
+        )
     except (EnvironmentError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

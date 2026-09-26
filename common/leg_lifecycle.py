@@ -45,12 +45,23 @@ from kiteconnect.exceptions import (
     TokenException,
 )
 
+from broker_errors import BrokerAuthError, BrokerError
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover - Python < 3.9 fallback
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 IST = ZoneInfo("Asia/Kolkata")
+
+# Any broker's client (kiteconnect.KiteConnect or common/jainam_client.py's
+# JainamClient) raises from this combined vocabulary -- BrokerError/
+# BrokerAuthError are Jainam's (and any future broker's) equivalents of
+# KiteException/TokenException, so every retry/error-handling path below
+# treats both brokers' failures identically rather than special-casing one.
+RETRYABLE_BROKER_EXCEPTIONS = (NetworkException, KiteException, BrokerError)
+AUTH_BROKER_EXCEPTIONS = (TokenException, BrokerAuthError)
+ORDER_PLACEMENT_EXCEPTIONS = (TokenException, NetworkException, KiteException, InputException, DataException, BrokerError)
 
 # --------------------------------------------------------------------------
 # Constants
@@ -170,7 +181,7 @@ def retry_call(
         try:
             return func(*args, **kwargs)
         except RuntimeError as exc:
-            if isinstance(exc.__cause__, TokenException):
+            if isinstance(exc.__cause__, AUTH_BROKER_EXCEPTIONS):
                 raise
             last_exc = exc
             logger.warning("%s failed (attempt %d/%d): %s", description, attempt, max_attempts, exc)
@@ -194,9 +205,9 @@ def fetch_ltp(
         try:
             result = kite.ltp([key])
             return float(result[key]["last_price"])
-        except TokenException:
+        except AUTH_BROKER_EXCEPTIONS:
             raise
-        except (NetworkException, KiteException) as exc:
+        except RETRYABLE_BROKER_EXCEPTIONS as exc:
             last_exc = exc
             logger.warning("ltp(%s) failed (attempt %d/%d): %s", tradingsymbol, attempt, max_attempts, exc)
             if attempt < max_attempts:
@@ -224,7 +235,7 @@ def fetch_fill_price(
     for attempt in range(1, max_attempts + 1):
         try:
             history = kite.order_history(order_id)
-        except (NetworkException, KiteException) as exc:
+        except RETRYABLE_BROKER_EXCEPTIONS as exc:
             logger.warning(
                 "order_history(%s) failed (attempt %d/%d): %s", order_id, attempt, max_attempts, exc
             )
@@ -287,7 +298,7 @@ def execute_order(
             product=kite.PRODUCT_NRML,
             order_type=kite.ORDER_TYPE_MARKET,
         )
-    except (TokenException, NetworkException, KiteException, InputException, DataException) as exc:
+    except ORDER_PLACEMENT_EXCEPTIONS as exc:
         logger.critical(
             "ORDER PLACEMENT FAILED: %s %d x %s -- %s. Halting automation for this leg; "
             "manual intervention required.",
