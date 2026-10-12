@@ -2,17 +2,17 @@
 leg_lifecycle.py
 ==================
 
-Shared mechanics for short-options strategies via Zerodha Kite Connect:
-market-hours/scheduling helpers, retryable Kite calls, order execution
-(paper/live), and the stop-loss -> re-entry state transition.
+Shared mechanics for short-options strategies via Jainam's XTS Connect API
+(common/jainam_client.py's JainamClient): market-hours/scheduling helpers,
+retryable client calls, order execution (paper/live), and the stop-loss ->
+re-entry state transition.
 
 This module is exchange/index-agnostic on purpose -- it takes `exchange`
 as an explicit parameter wherever an instrument key or order needs one,
 rather than importing a hardcoded exchange constant from an index-specific
 delta model. That's what lets this exact same file be shared, unmodified,
-by every index's strategy folder (Nifty/helpers/leg_lifecycle.py and
-Sensex/helpers/leg_lifecycle.py are identical) without the underlying
-mechanics ever silently diverging between markets.
+by every index's strategy folder without the underlying mechanics ever
+silently diverging between markets.
 
 Used by both delta_strangle_strategy.py and delta_breakdown_strategy.py
 (within each index folder) so these mechanics also cannot silently diverge
@@ -36,15 +36,7 @@ from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from typing import Optional
 
-from kiteconnect import KiteConnect
-from kiteconnect.exceptions import (
-    DataException,
-    InputException,
-    KiteException,
-    NetworkException,
-    TokenException,
-)
-
+from jainam_client import JainamClient
 from broker_errors import BrokerAuthError, BrokerError
 
 try:
@@ -53,15 +45,6 @@ except ImportError:  # pragma: no cover - Python < 3.9 fallback
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 IST = ZoneInfo("Asia/Kolkata")
-
-# Any broker's client (kiteconnect.KiteConnect or common/jainam_client.py's
-# JainamClient) raises from this combined vocabulary -- BrokerError/
-# BrokerAuthError are Jainam's (and any future broker's) equivalents of
-# KiteException/TokenException, so every retry/error-handling path below
-# treats both brokers' failures identically rather than special-casing one.
-RETRYABLE_BROKER_EXCEPTIONS = (NetworkException, KiteException, BrokerError)
-AUTH_BROKER_EXCEPTIONS = (TokenException, BrokerAuthError)
-ORDER_PLACEMENT_EXCEPTIONS = (TokenException, NetworkException, KiteException, InputException, DataException, BrokerError)
 
 # --------------------------------------------------------------------------
 # Constants
@@ -156,7 +139,7 @@ def sleep_until(target_dt: datetime, chunk_seconds: int = SLEEP_CHUNK_SECONDS) -
 
 
 # --------------------------------------------------------------------------
-# Retry wrapper for read-only Kite calls (instrument/quote fetches)
+# Retry wrapper for read-only broker calls (instrument/quote fetches)
 # --------------------------------------------------------------------------
 
 
@@ -169,19 +152,19 @@ def retry_call(
     backoff_seconds: int = RETRYABLE_BACKOFF_SECONDS,
     **kwargs,
 ):
-    """Retry a nifty_delta_model.py fetch function a few times on transient failure.
+    """Retry a delta-model fetch function a few times on transient failure.
 
-    Those functions raise RuntimeError(...) from <original KiteException> on
-    Kite errors, so the original exception is inspected via __cause__: a
-    TokenException is not retried (auth is broken, retrying can't help), but
-    NetworkException / other KiteException failures are retried with backoff.
+    Those functions raise RuntimeError(...) from <original BrokerError> on
+    Jainam errors, so the original exception is inspected via __cause__: a
+    BrokerAuthError is not retried (auth is broken, retrying can't help),
+    but other BrokerError failures are retried with backoff.
     """
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
             return func(*args, **kwargs)
         except RuntimeError as exc:
-            if isinstance(exc.__cause__, AUTH_BROKER_EXCEPTIONS):
+            if isinstance(exc.__cause__, BrokerAuthError):
                 raise
             last_exc = exc
             logger.warning("%s failed (attempt %d/%d): %s", description, attempt, max_attempts, exc)
@@ -191,7 +174,7 @@ def retry_call(
 
 
 def fetch_ltp(
-    kite: KiteConnect,
+    client: JainamClient,
     tradingsymbol: str,
     logger: logging.Logger,
     exchange: str,
@@ -203,11 +186,11 @@ def fetch_ltp(
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
-            result = kite.ltp([key])
+            result = client.ltp([key])
             return float(result[key]["last_price"])
-        except AUTH_BROKER_EXCEPTIONS:
+        except BrokerAuthError:
             raise
-        except RETRYABLE_BROKER_EXCEPTIONS as exc:
+        except BrokerError as exc:
             last_exc = exc
             logger.warning("ltp(%s) failed (attempt %d/%d): %s", tradingsymbol, attempt, max_attempts, exc)
             if attempt < max_attempts:
@@ -221,7 +204,7 @@ def fetch_ltp(
 
 
 def fetch_fill_price(
-    kite: KiteConnect,
+    client: JainamClient,
     order_id: str,
     logger: logging.Logger,
     poll_interval: int = ORDER_FILL_POLL_INTERVAL_SECONDS,
@@ -234,8 +217,8 @@ def fetch_fill_price(
     """
     for attempt in range(1, max_attempts + 1):
         try:
-            history = kite.order_history(order_id)
-        except RETRYABLE_BROKER_EXCEPTIONS as exc:
+            history = client.order_history(order_id)
+        except BrokerError as exc:
             logger.warning(
                 "order_history(%s) failed (attempt %d/%d): %s", order_id, attempt, max_attempts, exc
             )
@@ -262,7 +245,7 @@ def fetch_fill_price(
 
 
 def execute_order(
-    kite: KiteConnect,
+    client: JainamClient,
     logger: logging.Logger,
     tradingsymbol: str,
     transaction_type: str,
@@ -281,7 +264,7 @@ def execute_order(
     order).
     """
     if not live:
-        simulated_price = fetch_ltp(kite, tradingsymbol, logger, exchange)
+        simulated_price = fetch_ltp(client, tradingsymbol, logger, exchange)
         logger.info(
             "[PAPER] %s %d x %s @ ~%.2f (simulated market fill, no real order placed)",
             transaction_type, quantity, tradingsymbol, simulated_price,
@@ -289,16 +272,16 @@ def execute_order(
         return simulated_price
 
     try:
-        order_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
+        order_id = client.place_order(
+            variety=client.VARIETY_REGULAR,
             exchange=exchange,
             tradingsymbol=tradingsymbol,
             transaction_type=transaction_type,
             quantity=quantity,
-            product=kite.PRODUCT_NRML,
-            order_type=kite.ORDER_TYPE_MARKET,
+            product=client.PRODUCT_NRML,
+            order_type=client.ORDER_TYPE_MARKET,
         )
-    except ORDER_PLACEMENT_EXCEPTIONS as exc:
+    except BrokerError as exc:
         logger.critical(
             "ORDER PLACEMENT FAILED: %s %d x %s -- %s. Halting automation for this leg; "
             "manual intervention required.",
@@ -310,7 +293,7 @@ def execute_order(
         "Order placed: %s %d x %s -- order_id=%s. Waiting for fill confirmation...",
         transaction_type, quantity, tradingsymbol, order_id,
     )
-    fill_price = fetch_fill_price(kite, order_id, logger)
+    fill_price = fetch_fill_price(client, order_id, logger)
     logger.info(
         "Order %s CONFIRMED FILLED: %s %d x %s @ %.2f", order_id, transaction_type, quantity, tradingsymbol, fill_price
     )
@@ -325,14 +308,14 @@ def execute_order(
 
 
 def handle_stop_loss(
-    kite: KiteConnect, logger: logging.Logger, leg_key: str, leg: dict, quantity: int, live: bool, exchange: str
+    client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict, quantity: int, live: bool, exchange: str
 ) -> dict:
     """Square off (BUY) a leg that hit its stop-loss; mark it watching_for_reentry.
 
     entry_price is intentionally NOT overwritten here -- it stays as the
     level to watch for re-entry.
     """
-    exit_price = execute_order(kite, logger, leg["tradingsymbol"], "BUY", quantity, live, exchange)
+    exit_price = execute_order(client, logger, leg["tradingsymbol"], "BUY", quantity, live, exchange)
     pnl = (leg["entry_price"] - exit_price) * quantity
     leg["realized_pnl"] = leg.get("realized_pnl", 0.0) + pnl
     leg["stop_count"] = leg.get("stop_count", 0) + 1
@@ -357,10 +340,10 @@ def handle_stop_loss(
 
 
 def handle_reentry(
-    kite: KiteConnect, logger: logging.Logger, leg_key: str, leg: dict, quantity: int, live: bool, exchange: str
+    client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict, quantity: int, live: bool, exchange: str
 ) -> dict:
     """Re-sell a flat, watching leg at market; the new fill becomes its new entry_price."""
-    new_entry_price = execute_order(kite, logger, leg["tradingsymbol"], "SELL", quantity, live, exchange)
+    new_entry_price = execute_order(client, logger, leg["tradingsymbol"], "SELL", quantity, live, exchange)
     leg["entry_price"] = new_entry_price
     leg["reentry_count"] = leg.get("reentry_count", 0) + 1
     leg["status"] = "open"
@@ -380,7 +363,7 @@ def handle_reentry(
 
 
 def apply_stop_loss_or_reentry(
-    kite: KiteConnect,
+    client: JainamClient,
     logger: logging.Logger,
     leg_key: str,
     leg: dict,
@@ -401,7 +384,7 @@ def apply_stop_loss_or_reentry(
     correctly even if the script is restarted mid-cycle.
     """
     if leg["status"] == "open" and ltp >= leg["entry_price"] * stop_loss_multiplier:
-        leg = handle_stop_loss(kite, logger, leg_key, leg, quantity, live, exchange)
+        leg = handle_stop_loss(client, logger, leg_key, leg, quantity, live, exchange)
     elif leg["status"] == "watching_for_reentry" and ltp <= leg["entry_price"]:
         reentry_count = leg.get("reentry_count", 0)
         if max_reentries is not None and reentry_count >= max_reentries:
@@ -411,7 +394,7 @@ def apply_stop_loss_or_reentry(
             )
             leg["status"] = "capped_flat"
         else:
-            leg = handle_reentry(kite, logger, leg_key, leg, quantity, live, exchange)
+            leg = handle_reentry(client, logger, leg_key, leg, quantity, live, exchange)
     return leg
 
 
@@ -422,5 +405,5 @@ def apply_stop_loss_or_reentry(
 
 def print_live_warning_banner() -> None:
     print("!" * 78)
-    print("!!!  LIVE TRADING MODE -- REAL ORDERS WILL BE PLACED ON YOUR ZERODHA ACCOUNT  !!!")
+    print("!!!  LIVE TRADING MODE -- REAL ORDERS WILL BE PLACED ON YOUR JAINAM ACCOUNT  !!!")
     print("!" * 78)

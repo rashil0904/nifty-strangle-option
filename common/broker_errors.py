@@ -2,19 +2,17 @@
 broker_errors.py
 ==================
 
-Broker-agnostic error types, so leg_lifecycle.py and the delta models can
-catch "a broker call failed" / "a broker call failed due to auth" without
-hardcoding kiteconnect's exception classes -- those are Kite-specific and
-don't cover a second broker's failure modes.
+Error types for jainam_client.py's failures, so leg_lifecycle.py and the
+delta models can catch "a broker call failed" / "a broker call failed due
+to auth" via one consistent vocabulary rather than reaching into requests'
+or XTS's own exception/response shapes directly.
 
-Every broker adapter (Kite is used directly; Jainam via jainam_client.py)
-wraps its own transport-level errors into these before they reach shared
-code, so retry_call()'s isinstance(exc.__cause__, ...) auth-check and the
-various `except (..., KiteException, ...)` clauses across the codebase can
-treat any broker's failures the same way: BrokerAuthError is never retried
-(the credentials are broken, retrying can't help), everything else
-(BrokerError) is retried with backoff like NetworkException/KiteException
-already are.
+jainam_client.py wraps its own transport-level errors into these before
+they reach shared code, so retry_call()'s isinstance(exc.__cause__, ...)
+auth-check and the various `except BrokerError` clauses across the
+codebase treat every failure the same way: BrokerAuthError is never
+retried (the credentials are broken, retrying can't help), everything else
+(BrokerError) is retried with backoff.
 """
 
 from __future__ import annotations

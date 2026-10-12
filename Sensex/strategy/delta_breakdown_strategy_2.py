@@ -2,12 +2,12 @@
 delta_breakdown_strategy_2.py
 ===============================
 
-Live short-options "breakdown" strategy on SENSEX weekly options via Zerodha
-Kite Connect -- a third, independent SENSEX strategy. Runs alongside (not
-instead of) delta_strangle_strategy.py and delta_breakdown_strategy.py --
-separate contracts, separate state file (breakdown_strategy_2_state_sensex.json),
-separate process. All three scripts are independent and never touch each
-other's positions or state.
+Live short-options "breakdown" strategy on SENSEX weekly options via
+Jainam (XTS Connect) -- a third, independent SENSEX strategy. Runs
+alongside (not instead of) delta_strangle_strategy.py and
+delta_breakdown_strategy.py -- separate contracts, separate state file
+(breakdown_strategy_2_state_sensex.json), separate process. All three
+scripts are independent and never touch each other's positions or state.
 
 This is structurally identical to delta_breakdown_strategy.py ("Part 2"),
 with exactly two timing constants changed: the tracking window ends (and
@@ -54,26 +54,25 @@ intended order, never calls the broker's order-placement call) unless
 --live is explicitly passed. A loud warning banner prints whenever --live
 is active.
 
-Broker: --broker kite (default) or --broker jainam, dispatched via
-common/broker_client.py -- see delta_strangle_strategy.py's docstring for
-the full explanation (this script shares that same dispatch, and the same
-per-broker state/log file scoping via _broker_scoped_filename).
+Broker: trades via common/jainam_client.py's JainamClient (JAINAM_*
+environment variables) -- see delta_strangle_strategy.py's docstring for
+the full explanation.
 
-Reused from sensex_delta_model.py (imported, not duplicated): get_kite_client,
+Reused from sensex_delta_model.py (imported, not duplicated): get_jainam_client,
 fetch_instruments, select_option_chain_instruments, select_nearest_option_expiry,
 select_nearest_future, fetch_option_chain_quotes, fetch_spot_and_futures,
 time_to_expiry_years, black76_price, implied_vol, black76_delta.
 
-Shared mechanics (state persistence, market-hours/scheduling, retryable Kite
-calls, order execution, stop-loss -> re-entry) live in common/leg_lifecycle.py
-and are reused (not duplicated) here and in delta_strangle_strategy.py and
-delta_breakdown_strategy.py, so those mechanics cannot silently diverge
-across all three strategies: every script calls the exact same
-handle_stop_loss/handle_reentry/execute_order functions underneath, just
-with different thresholds and timing passed in. Only TRACKED_LOW_FREEZE_TIME
-and BREAKOUT_START_TIME differ between this file and delta_breakdown_strategy.py
--- the underlying selection/tracking/breakout/stop-loss/re-entry logic is
-identical code, not a re-derived copy.
+Shared mechanics (state persistence, market-hours/scheduling, retryable
+broker calls, order execution, stop-loss -> re-entry) live in
+common/leg_lifecycle.py and are reused (not duplicated) here and in
+delta_strangle_strategy.py and delta_breakdown_strategy.py, so those
+mechanics cannot silently diverge across all three strategies: every
+script calls the exact same handle_stop_loss/handle_reentry/execute_order
+functions underneath, just with different thresholds and timing passed in.
+Only TRACKED_LOW_FREEZE_TIME and BREAKOUT_START_TIME differ between this
+file and delta_breakdown_strategy.py -- the underlying selection/tracking/
+breakout/stop-loss/re-entry logic is identical code, not a re-derived copy.
 
 Assumptions / known limitations (flagged explicitly rather than silently
 assumed)
@@ -130,8 +129,6 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from kiteconnect import KiteConnect
-
 # sensex_delta_model.py lives in ../helpers, and leg_lifecycle.py (shared
 # with Nifty) lives in ../../common -- neither is on the default import
 # path, so add both explicitly (paths are resolved from this script's own
@@ -140,10 +137,11 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "helpers"))
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "..", "common"))
 
+from jainam_client import JainamClient
 from sensex_delta_model import (
     IST,
     BFO_EXCHANGE,
-    get_kite_client,
+    get_jainam_client,
     fetch_instruments,
     select_option_chain_instruments,
     select_nearest_option_expiry,
@@ -173,7 +171,6 @@ from leg_lifecycle import (
     apply_stop_loss_or_reentry,
     print_live_warning_banner,
 )
-from broker_client import get_broker_client
 
 # --------------------------------------------------------------------------
 # Constants
@@ -196,8 +193,7 @@ STOP_LOSS_MULTIPLIER = 1.30
 DEFAULT_R = 0.065  # matches sensex_delta_model.py's default; not CLI-configurable here (see docstring point 4)
 
 # --------------------------------------------------------------------------
-# Logging: console always; the file handler is attached in run() once
-# --broker is known (see delta_strangle_strategy.py for why).
+# Logging
 # --------------------------------------------------------------------------
 
 logger = logging.getLogger("sensex_delta_breakdown_strategy_2")
@@ -207,43 +203,26 @@ _formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_formatter)
 logger.addHandler(_console_handler)
-
-
-def _broker_scoped_filename(filename: str, broker: str) -> str:
-    """kite keeps the original filename (backward compatible); any other
-    broker gets a suffix, so e.g. breakdown_strategy_2_state_sensex.json /
-    breakdown_strategy_2_state_sensex_jainam.json can never collide if both
-    are run concurrently."""
-    if broker == "kite":
-        return filename
-    stem, _, ext = filename.rpartition(".")
-    return f"{stem}_{broker}.{ext}"
-
-
-def _attach_file_handler(broker: str) -> str:
-    log_file = _broker_scoped_filename(LOG_FILE, broker)
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(_formatter)
-    logger.addHandler(file_handler)
-    return log_file
+_file_handler = logging.FileHandler(LOG_FILE)
+_file_handler.setFormatter(_formatter)
+logger.addHandler(_file_handler)
 
 
 # --------------------------------------------------------------------------
-# State persistence (thin wrappers around leg_lifecycle, bound to whichever
-# broker-scoped state file this run resolved in run())
+# State persistence (thin wrappers around leg_lifecycle, bound to STATE_FILE)
 # --------------------------------------------------------------------------
 
 
-def save_state(state: dict, state_file: str) -> None:
-    _lifecycle_save_state(state, state_file)
+def save_state(state: dict) -> None:
+    _lifecycle_save_state(state, STATE_FILE)
 
 
-def load_state(state_file: str) -> Optional[dict]:
-    return _lifecycle_load_state(state_file, logger)
+def load_state() -> Optional[dict]:
+    return _lifecycle_load_state(STATE_FILE, logger)
 
 
-def clear_state(state_file: str) -> None:
-    _lifecycle_clear_state(state_file)
+def clear_state() -> None:
+    _lifecycle_clear_state(STATE_FILE)
 
 
 # --------------------------------------------------------------------------
@@ -277,7 +256,7 @@ def exit_deadline_from_selection(selection_dt: datetime) -> datetime:
 
 
 # --------------------------------------------------------------------------
-# Retryable Kite calls / order execution (thin wrappers around
+# Retryable broker calls / order execution (thin wrappers around
 # leg_lifecycle, bound to this module's logger)
 # --------------------------------------------------------------------------
 
@@ -286,12 +265,12 @@ def _retry_call(func, *args, description: str = "call", **kwargs):
     return _lifecycle_retry_call(logger, func, *args, description=description, **kwargs)
 
 
-def fetch_ltp(kite: KiteConnect, tradingsymbol: str) -> float:
-    return _lifecycle_fetch_ltp(kite, tradingsymbol, logger, BFO_EXCHANGE)
+def fetch_ltp(client: JainamClient, tradingsymbol: str) -> float:
+    return _lifecycle_fetch_ltp(client, tradingsymbol, logger, BFO_EXCHANGE)
 
 
-def _execute_order(kite: KiteConnect, tradingsymbol: str, transaction_type: str, quantity: int, live: bool) -> float:
-    return _lifecycle_execute_order(kite, logger, tradingsymbol, transaction_type, quantity, live, BFO_EXCHANGE)
+def _execute_order(client: JainamClient, tradingsymbol: str, transaction_type: str, quantity: int, live: bool) -> float:
+    return _lifecycle_execute_order(client, logger, tradingsymbol, transaction_type, quantity, live, BFO_EXCHANGE)
 
 
 # --------------------------------------------------------------------------
@@ -299,7 +278,7 @@ def _execute_order(kite: KiteConnect, tradingsymbol: str, transaction_type: str,
 # --------------------------------------------------------------------------
 
 
-def select_entry_strikes(kite: KiteConnect, instruments: pd.DataFrame) -> dict:
+def select_entry_strikes(client: JainamClient, instruments: pd.DataFrame) -> dict:
     """Nearest weekly SENSEX expiry -> option chain + futures price -> Black-76
     delta per strike/side -> the call closest to +0.30 delta and the put
     closest to -0.30 delta (by absolute difference). Identical selection
@@ -314,10 +293,10 @@ def select_entry_strikes(kite: KiteConnect, instruments: pd.DataFrame) -> dict:
     future_row = select_nearest_future(instruments)
 
     chain = _retry_call(
-        fetch_option_chain_quotes, kite, chain_instruments, description="fetch_option_chain_quotes"
+        fetch_option_chain_quotes, client, chain_instruments, description="fetch_option_chain_quotes"
     )
     spot, futures_price = _retry_call(
-        fetch_spot_and_futures, kite, future_row["tradingsymbol"], description="fetch_spot_and_futures"
+        fetch_spot_and_futures, client, future_row["tradingsymbol"], description="fetch_spot_and_futures"
     )
     T = time_to_expiry_years(expiry)
 
@@ -368,14 +347,14 @@ def track_low(existing_low: Optional[float], ltp: float) -> float:
     return min(existing_low, ltp)
 
 
-def run_selection_scan(kite: KiteConnect, lots: int, live: bool, max_reentries: Optional[int], state_file: str) -> dict:
+def run_selection_scan(client: JainamClient, lots: int, live: bool, max_reentries: Optional[int]) -> dict:
     """09:45 sequence: lock the call/put contracts for the day and seed each
     leg's tracked_low with an initial LTP read. No orders are placed here --
     a leg only becomes a position once it breaks out (see check_breakout)."""
     logger.info("=" * 70)
     logger.info("CONTRACT SELECTION starting...")
-    instruments = _retry_call(fetch_instruments, kite, description="fetch_instruments")
-    selection = select_entry_strikes(kite, instruments)
+    instruments = _retry_call(fetch_instruments, client, description="fetch_instruments")
+    selection = select_entry_strikes(client, instruments)
 
     call_lot, put_lot = selection["call"]["lot_size"], selection["put"]["lot_size"]
     if call_lot != put_lot:
@@ -396,7 +375,7 @@ def run_selection_scan(kite: KiteConnect, lots: int, live: bool, max_reentries: 
 
     for leg_key in ("call", "put"):
         leg_selection = selection[leg_key]
-        initial_ltp = fetch_ltp(kite, leg_selection["tradingsymbol"])
+        initial_ltp = fetch_ltp(client, leg_selection["tradingsymbol"])
         state["legs"][leg_key] = {
             "tradingsymbol": leg_selection["tradingsymbol"],
             "strike": leg_selection["strike"],
@@ -425,7 +404,7 @@ def run_selection_scan(kite: KiteConnect, lots: int, live: bool, max_reentries: 
             leg_key, leg_selection["tradingsymbol"], leg_selection["strike"], leg_selection["delta"], initial_ltp,
         )
 
-    save_state(state, state_file)
+    save_state(state)
     logger.info(
         "CONTRACT SELECTION complete. Tracking until %s, exit deadline %s.",
         TRACKED_LOW_FREEZE_TIME, state["exit_deadline"],
@@ -448,9 +427,9 @@ def check_breakout(leg: dict, ltp: float) -> bool:
     )
 
 
-def place_entry(kite: KiteConnect, leg_key: str, leg: dict, quantity: int, live: bool) -> dict:
+def place_entry(client: JainamClient, leg_key: str, leg: dict, quantity: int, live: bool) -> dict:
     """Breakout SELL entry for a leg that just broke below its frozen tracked_low."""
-    entry_price = _execute_order(kite, leg["tradingsymbol"], "SELL", quantity, live)
+    entry_price = _execute_order(client, leg["tradingsymbol"], "SELL", quantity, live)
     now = datetime.now(IST).isoformat()
     leg["entry_price"] = entry_price
     leg["entry_time"] = now
@@ -477,7 +456,7 @@ def place_entry(kite: KiteConnect, leg_key: str, leg: dict, quantity: int, live:
 
 
 def monitor_leg(
-    kite: KiteConnect, leg_key: str, leg: dict, quantity: int, max_reentries: Optional[int], live: bool, now: datetime
+    client: JainamClient, leg_key: str, leg: dict, quantity: int, max_reentries: Optional[int], live: bool, now: datetime
 ) -> dict:
     """One polling check for a single leg, dispatched by its current phase:
 
@@ -497,7 +476,7 @@ def monitor_leg(
         return leg
 
     try:
-        ltp = fetch_ltp(kite, leg["tradingsymbol"])
+        ltp = fetch_ltp(client, leg["tradingsymbol"])
     except RuntimeError as exc:
         logger.warning(
             "Could not fetch LTP for %s (%s) this poll: %s -- will retry next cycle.",
@@ -520,7 +499,7 @@ def monitor_leg(
                     )
                 if now.time() >= BREAKOUT_START_TIME:
                     if check_breakout(leg, ltp):
-                        leg = place_entry(kite, leg_key, leg, quantity, live)
+                        leg = place_entry(client, leg_key, leg, quantity, live)
                     elif now.time() >= MARKET_CLOSE_TIME:
                         leg["status"] = "no_entry"
                         logger.info(
@@ -530,12 +509,12 @@ def monitor_leg(
                         )
         elif leg["status"] in ("open", "watching_for_reentry"):
             leg = apply_stop_loss_or_reentry(
-                kite, logger, leg_key, leg, ltp, quantity, live, STOP_LOSS_MULTIPLIER, max_reentries, BFO_EXCHANGE
+                client, logger, leg_key, leg, ltp, quantity, live, STOP_LOSS_MULTIPLIER, max_reentries, BFO_EXCHANGE
             )
     except RuntimeError as exc:
         logger.critical(
             "AUTOMATION HALTED for %s leg (%s) after an order failure: %s. This leg will no longer be "
-            "monitored automatically -- check your Zerodha positions manually.",
+            "monitored automatically -- check your Jainam positions manually.",
             leg_key, leg["tradingsymbol"], exc,
         )
         leg["status"] = "error"
@@ -544,16 +523,16 @@ def monitor_leg(
     return leg
 
 
-def handle_stop_loss(kite: KiteConnect, leg_key: str, leg: dict, quantity: int, live: bool) -> dict:
-    return _lifecycle_handle_stop_loss(kite, logger, leg_key, leg, quantity, live, BFO_EXCHANGE)
+def handle_stop_loss(client: JainamClient, leg_key: str, leg: dict, quantity: int, live: bool) -> dict:
+    return _lifecycle_handle_stop_loss(client, logger, leg_key, leg, quantity, live, BFO_EXCHANGE)
 
 
-def handle_reentry(kite: KiteConnect, leg_key: str, leg: dict, quantity: int, live: bool) -> dict:
-    return _lifecycle_handle_reentry(kite, logger, leg_key, leg, quantity, live, BFO_EXCHANGE)
+def handle_reentry(client: JainamClient, leg_key: str, leg: dict, quantity: int, live: bool) -> dict:
+    return _lifecycle_handle_reentry(client, logger, leg_key, leg, quantity, live, BFO_EXCHANGE)
 
 
 def run_monitoring_loop(
-    kite: KiteConnect, state: dict, live: bool, max_reentries: Optional[int], poll_seconds: int, state_file: str
+    client: JainamClient, state: dict, live: bool, max_reentries: Optional[int], poll_seconds: int
 ) -> dict:
     """Poll every non-terminal leg every poll_seconds until the exit deadline,
     sleeping straight through non-market hours."""
@@ -581,9 +560,9 @@ def run_monitoring_loop(
         for leg_key in ("call", "put"):
             leg = state["legs"][leg_key]
             if leg["status"] in active_statuses:
-                state["legs"][leg_key] = monitor_leg(kite, leg_key, leg, quantity, max_reentries, live, now)
+                state["legs"][leg_key] = monitor_leg(client, leg_key, leg, quantity, max_reentries, live, now)
 
-        save_state(state, state_file)
+        save_state(state)
         time.sleep(poll_seconds)
 
     return state
@@ -594,14 +573,14 @@ def run_monitoring_loop(
 # --------------------------------------------------------------------------
 
 
-def exit_all(kite: KiteConnect, state: dict, live: bool, state_file: str) -> dict:
+def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
     """Square off any leg still 'open' regardless of P&L; leave flat legs
     untouched. Logs final per-leg P&L and stop/re-entry counts."""
     quantity = state["quantity"]
     for leg_key, leg in state["legs"].items():
         if leg["status"] == "open":
             try:
-                exit_price = _execute_order(kite, leg["tradingsymbol"], "BUY", quantity, live)
+                exit_price = _execute_order(client, leg["tradingsymbol"], "BUY", quantity, live)
                 pnl = (leg["entry_price"] - exit_price) * quantity
                 leg["realized_pnl"] = leg.get("realized_pnl", 0.0) + pnl
                 leg["status"] = "closed"
@@ -620,7 +599,7 @@ def exit_all(kite: KiteConnect, state: dict, live: bool, state_file: str) -> dic
                 )
             except RuntimeError as exc:
                 logger.critical(
-                    "FINAL EXIT FAILED for %s leg (%s): %s. This leg may still be OPEN on your Zerodha "
+                    "FINAL EXIT FAILED for %s leg (%s): %s. This leg may still be OPEN on your Jainam "
                     "account -- check and close it manually.",
                     leg_key, leg["tradingsymbol"], exc,
                 )
@@ -637,7 +616,7 @@ def exit_all(kite: KiteConnect, state: dict, live: bool, state_file: str) -> dic
             leg_key, leg.get("stop_count", 0), leg.get("reentry_count", 0), leg.get("realized_pnl", 0.0),
         )
 
-    save_state(state, state_file)
+    save_state(state)
     return state
 
 
@@ -647,19 +626,15 @@ def exit_all(kite: KiteConnect, state: dict, live: bool, state_file: str) -> dic
 
 
 def run(args: argparse.Namespace) -> None:
-    log_file = _attach_file_handler(args.broker)
-    logger.info("Broker: %s. Logging to %s.", args.broker, log_file)
+    client = get_jainam_client()
 
-    state_file = _broker_scoped_filename(STATE_FILE, args.broker)
-    kite = get_broker_client(args.broker, get_kite_client)
-
-    state = load_state(state_file)
+    state = load_state()
     if state is not None:
         live = state.get("live", False)
         max_reentries = state.get("max_reentries")
         logger.info(
             "Existing cycle found in %s (selection_time=%s) -- resuming (live=%s, max_reentries=%s).",
-            state_file, state.get("selection_time"), live, max_reentries,
+            STATE_FILE, state.get("selection_time"), live, max_reentries,
         )
         if live != args.live:
             logger.warning(
@@ -675,7 +650,7 @@ def run(args: argparse.Namespace) -> None:
         max_reentries = args.max_reentries
         if live:
             print_live_warning_banner()
-            logger.warning("LIVE MODE ACTIVE -- real orders will be placed on this %s account.", args.broker)
+            logger.warning("LIVE MODE ACTIVE -- real orders will be placed on this Jainam account.")
         else:
             logger.info("Running in PAPER mode -- no real orders will be placed. Pass --live to trade for real.")
 
@@ -685,15 +660,15 @@ def run(args: argparse.Namespace) -> None:
             logger.info("Waiting until %s IST for contract selection...", selection_dt.isoformat())
             sleep_until(selection_dt)
 
-        state = run_selection_scan(kite, args.lots, live, max_reentries, state_file)
+        state = run_selection_scan(client, args.lots, live, max_reentries)
 
-    state = run_monitoring_loop(kite, state, live, max_reentries, args.poll_seconds, state_file)
+    state = run_monitoring_loop(client, state, live, max_reentries, args.poll_seconds)
 
     logger.info("Squaring off any remaining open legs for final exit.")
-    state = exit_all(kite, state, live, state_file)
+    state = exit_all(client, state, live)
 
-    clear_state(state_file)
-    logger.info("Cycle complete. %s cleared. Ready for the next cycle.", state_file)
+    clear_state()
+    logger.info("Cycle complete. %s cleared. Ready for the next cycle.", STATE_FILE)
 
 
 # --------------------------------------------------------------------------
@@ -703,7 +678,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Live short-options breakdown strategy on SENSEX weekly options via Kite Connect."
+        description="Live short-options breakdown strategy on SENSEX weekly options via Jainam (XTS Connect)."
     )
     parser.add_argument(
         "--lots", type=int, default=1, help="Number of SENSEX lots per leg (quantity = lot_size * lots). Default: 1."
@@ -724,16 +699,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         "--live",
         action="store_true",
         help="Place real orders. Default (omitted): paper mode -- compute and log everything, never "
-        "call kite.place_order().",
-    )
-    parser.add_argument(
-        "--broker",
-        choices=("kite", "jainam"),
-        default="kite",
-        help="Which broker to trade through. Default: kite. --broker jainam uses "
-        "common/jainam_client.py (JAINAM_* environment variables); its order-placement path is "
-        "unverified against a live Jainam session -- see that module's docstring before using --live "
-        "with --broker jainam.",
+        "call the broker's order-placement endpoint.",
     )
     return parser.parse_args(argv)
 

@@ -2,8 +2,9 @@
 sensex_delta_model.py
 =======================
 
-Pulls a live SENSEX option chain from Zerodha's Kite Connect API and
-computes implied volatility (IV) and delta two ways for every strike/side:
+Pulls a live SENSEX option chain from Jainam's XTS Connect API (via
+common/jainam_client.py) and computes implied volatility (IV) and delta
+two ways for every strike/side:
 
   1. Spot-based, via Black-Scholes, using the BSE SENSEX index spot price.
   2. Futures-based, via Black-76, using the nearest-expiry SENSEX futures
@@ -15,8 +16,8 @@ the input (S vs F) and the corresponding pricing formula.
 
 This is the SENSEX/BSE counterpart of nifty_delta_model.py: identical math
 and data-fetching logic, with the index-specific constants swapped --
-SENSEX contracts and futures trade on Kite's "BFO" (BSE F&O) exchange
-segment rather than "NFO", and the spot symbol is BSE:SENSEX rather than
+SENSEX contracts and futures trade on the "BFO" (BSE F&O) exchange segment
+rather than "NFO", and the spot symbol is BSE:SENSEX rather than
 NSE:NIFTY 50.
 
 Why spot-based BS needs a dividend-yield guess and futures-based Black-76
@@ -85,7 +86,6 @@ import logging
 import math
 import os
 import sys
-import json
 from datetime import date, datetime
 from datetime import time as dtime
 from typing import Callable, Optional
@@ -100,27 +100,13 @@ try:
 except ImportError:  # pragma: no cover - Python < 3.9 fallback
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
-try:
-    from kiteconnect import KiteConnect
-    from kiteconnect.exceptions import (
-        DataException,
-        InputException,
-        KiteException,
-        NetworkException,
-        TokenException,
-    )
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "kiteconnect is not installed. Install it with `pip install kiteconnect`."
-    ) from exc
-
-# broker_errors.py / broker_client.py live in ../../common relative to this
+# broker_errors.py / jainam_client.py live in ../../common relative to this
 # file (shared with Nifty and every strategy script) -- not on the default
 # import path when this module is run standalone, so add it explicitly.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "common"))
 
 from broker_errors import BrokerAuthError, BrokerError
-from broker_client import get_broker_client
+from jainam_client import JainamClient
 
 # --------------------------------------------------------------------------
 # Constants
@@ -129,16 +115,14 @@ from broker_client import get_broker_client
 IST = ZoneInfo("Asia/Kolkata")
 EXPIRY_SETTLEMENT_TIME = dtime(15, 30)  # exchange F&O expiry cutoff, IST
 DAYS_PER_YEAR = 365.0  # calendar-day convention; swap for a trading-day count later
-MAX_INSTRUMENTS_PER_QUOTE = 500  # Kite Connect per-call cap for kite.quote()
+MAX_INSTRUMENTS_PER_QUOTE = 500  # per-call cap for quote() batching
 IV_LOWER_BOUND = 0.01
 IV_UPPER_BOUND = 3.0
 VOL_SOLVER_XTOL = 1e-6
 
 SENSEX_SPOT_SYMBOL = "BSE:SENSEX"
 UNDERLYING_NAME = "SENSEX"
-BFO_EXCHANGE = "BFO"  # BSE F&O segment: where SENSEX options/futures trade on Kite
-
-KITE_SESSION_CACHE_PATH = os.path.expanduser("~/.kite_session.json")
+BFO_EXCHANGE = "BFO"  # BSE F&O segment: where SENSEX options/futures trade
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -152,54 +136,12 @@ _instrument_cache: dict[str, pd.DataFrame] = {}
 # --------------------------------------------------------------------------
 
 
-def _load_cached_session() -> Optional[dict]:
-    """Read a same-day cached Kite session written by kite_login_helper.py, if any.
-
-    Returns None if the cache file is missing, unreadable, or was generated on
-    a different IST calendar day (Kite access tokens are single-trading-day
-    only, so a stale cache is treated as absent rather than silently reused).
-
-    This cache is shared across indices (same Zerodha account/session works
-    for both NSE and BSE segments), so a login via either Nifty's or
-    Sensex's kite_login_helper.py satisfies both.
-    """
-    try:
-        with open(KITE_SESSION_CACHE_PATH) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
-
-    if data.get("date") != datetime.now(IST).date().isoformat():
-        return None
-    if not data.get("api_key") or not data.get("access_token"):
-        return None
-    return data
-
-
-def get_kite_client() -> KiteConnect:
-    """Build a KiteConnect client from KITE_API_KEY / KITE_ACCESS_TOKEN env vars,
-    falling back to the same-day session cached at KITE_SESSION_CACHE_PATH by
-    kite_login_helper.py if either env var is unset.
-
-    Assumes the access token is already valid; no login/token-refresh flow.
-    """
-    api_key = os.environ.get("KITE_API_KEY")
-    access_token = os.environ.get("KITE_ACCESS_TOKEN")
-
-    if not api_key or not access_token:
-        cached = _load_cached_session()
-        if cached:
-            api_key = api_key or cached["api_key"]
-            access_token = access_token or cached["access_token"]
-
-    if not api_key or not access_token:
-        raise EnvironmentError(
-            "KITE_API_KEY and KITE_ACCESS_TOKEN must be set as environment variables, or a valid "
-            f"same-day session must exist at {KITE_SESSION_CACHE_PATH} (run kite_login_helper.py)."
-        )
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-    return kite
+def get_jainam_client() -> JainamClient:
+    """Build a JainamClient from JAINAM_* environment variables (see
+    common/jainam_client.py). Jainam's login is a direct, non-interactive
+    appKey/secretKey POST, so this logs in fresh every call -- no session
+    cache to manage."""
+    return JainamClient.from_env()
 
 
 # --------------------------------------------------------------------------
@@ -207,21 +149,13 @@ def get_kite_client() -> KiteConnect:
 # --------------------------------------------------------------------------
 
 
-def fetch_instruments(kite: KiteConnect, exchange: str = BFO_EXCHANGE, use_cache: bool = True) -> pd.DataFrame:
+def fetch_instruments(client: JainamClient, exchange: str = BFO_EXCHANGE, use_cache: bool = True) -> pd.DataFrame:
     """Fetch (and cache for the session) the instrument master for `exchange`."""
     if use_cache and exchange in _instrument_cache:
         return _instrument_cache[exchange]
 
     try:
-        raw = kite.instruments(exchange)
-    except TokenException as exc:
-        raise RuntimeError(
-            "Kite access token expired or invalid while fetching instruments. Regenerate it and retry."
-        ) from exc
-    except NetworkException as exc:
-        raise RuntimeError(f"Network error contacting Kite while fetching instruments: {exc}") from exc
-    except KiteException as exc:
-        raise RuntimeError(f"Kite API error while fetching instruments: {exc}") from exc
+        raw = client.instruments(exchange)
     except BrokerAuthError as exc:
         raise RuntimeError(
             "Jainam credentials expired or invalid while fetching instruments. Regenerate them and retry."
@@ -231,7 +165,7 @@ def fetch_instruments(kite: KiteConnect, exchange: str = BFO_EXCHANGE, use_cache
 
     df = pd.DataFrame(raw)
     if df.empty:
-        raise RuntimeError(f"Kite returned no instruments for exchange {exchange!r}.")
+        raise RuntimeError(f"Jainam returned no instruments for exchange {exchange!r}.")
     df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
 
     if use_cache:
@@ -336,10 +270,10 @@ def _price_and_liquidity(quote: dict) -> tuple[float, bool]:
     return quote.get("last_price", np.nan), True
 
 
-def fetch_option_chain_quotes(kite: KiteConnect, chain_instruments: pd.DataFrame) -> pd.DataFrame:
-    """Batch-quote every CE/PE tradingsymbol in chain_instruments through kite.quote().
+def fetch_option_chain_quotes(client: JainamClient, chain_instruments: pd.DataFrame) -> pd.DataFrame:
+    """Batch-quote every CE/PE tradingsymbol in chain_instruments through client.quote().
 
-    Chunks the request if it exceeds Kite's per-call instrument cap. Returns a
+    Chunks the request if it exceeds MAX_INSTRUMENTS_PER_QUOTE. Returns a
     DataFrame with columns: strike, instrument_type, tradingsymbol, price,
     low_liquidity.
     """
@@ -348,17 +282,7 @@ def fetch_option_chain_quotes(kite: KiteConnect, chain_instruments: pd.DataFrame
     quotes: dict = {}
     for batch in _chunk(symbols, MAX_INSTRUMENTS_PER_QUOTE):
         try:
-            quotes.update(kite.quote(batch))
-        except TokenException as exc:
-            raise RuntimeError(
-                "Kite access token expired or invalid while fetching option quotes."
-            ) from exc
-        except NetworkException as exc:
-            raise RuntimeError(f"Network error fetching option quotes: {exc}") from exc
-        except (InputException, DataException) as exc:
-            raise RuntimeError(f"Kite rejected the option quote request: {exc}") from exc
-        except KiteException as exc:
-            raise RuntimeError(f"Kite API error fetching option quotes: {exc}") from exc
+            quotes.update(client.quote(batch))
         except BrokerAuthError as exc:
             raise RuntimeError("Jainam credentials expired or invalid while fetching option quotes.") from exc
         except BrokerError as exc:
@@ -383,30 +307,22 @@ def fetch_option_chain_quotes(kite: KiteConnect, chain_instruments: pd.DataFrame
         )
 
     if not rows:
-        raise RuntimeError("Kite returned no usable option quotes for the requested expiry.")
+        raise RuntimeError("Jainam returned no usable option quotes for the requested expiry.")
     return pd.DataFrame(rows)
 
 
-def fetch_spot_and_futures(kite: KiteConnect, futures_tradingsymbol: str) -> tuple[float, float]:
+def fetch_spot_and_futures(client: JainamClient, futures_tradingsymbol: str) -> tuple[float, float]:
     """Fetch the SENSEX index spot price and the nearest-expiry future's price."""
     fut_key = f"{BFO_EXCHANGE}:{futures_tradingsymbol}"
     try:
-        result = kite.quote([SENSEX_SPOT_SYMBOL, fut_key])
-    except TokenException as exc:
-        raise RuntimeError(
-            "Kite access token expired or invalid while fetching spot/futures quote."
-        ) from exc
-    except NetworkException as exc:
-        raise RuntimeError(f"Network error fetching spot/futures quote: {exc}") from exc
-    except KiteException as exc:
-        raise RuntimeError(f"Kite API error fetching spot/futures quote: {exc}") from exc
+        result = client.quote([SENSEX_SPOT_SYMBOL, fut_key])
     except BrokerAuthError as exc:
         raise RuntimeError("Jainam credentials expired or invalid while fetching spot/futures quote.") from exc
     except BrokerError as exc:
         raise RuntimeError(f"Jainam API error fetching spot/futures quote: {exc}") from exc
 
     if SENSEX_SPOT_SYMBOL not in result or fut_key not in result:
-        raise RuntimeError("Kite did not return both spot and futures quotes; response was incomplete.")
+        raise RuntimeError("Jainam did not return both spot and futures quotes; response was incomplete.")
 
     spot = result[SENSEX_SPOT_SYMBOL]["last_price"]
     futures_price = result[fut_key]["last_price"]
@@ -613,7 +529,7 @@ def print_summary(summary: pd.DataFrame) -> None:
 
 
 def run_single_expiry(
-    kite: KiteConnect,
+    client: JainamClient,
     instruments: pd.DataFrame,
     expiry_date: date,
     r: float,
@@ -646,10 +562,10 @@ def run_single_expiry(
     )
 
     logger.info("Fetching option chain quotes for %d instruments...", len(chain_instruments))
-    chain = fetch_option_chain_quotes(kite, chain_instruments)
+    chain = fetch_option_chain_quotes(client, chain_instruments)
 
     logger.info("Fetching spot and futures quotes...")
-    spot, futures_price = fetch_spot_and_futures(kite, future_row["tradingsymbol"])
+    spot, futures_price = fetch_spot_and_futures(client, future_row["tradingsymbol"])
 
     T = time_to_expiry_years(expiry_date, days_per_year=days_per_year)
 
@@ -663,7 +579,6 @@ def run(
     q: float,
     days_per_year: float = DAYS_PER_YEAR,
     futures_expiry: Optional[date] = None,
-    broker: str = "kite",
 ) -> pd.DataFrame:
     """Run the model for one or more expiries. Prints results to the console only.
 
@@ -682,18 +597,16 @@ def run(
     F (applies to every expiry in expiry_dates) instead of auto-selecting
     the nearest unexpired one.
 
-    broker: "kite" (default) or "jainam" -- see common/broker_client.py.
-    With broker="jainam", only the nearest option expiry is ever resolvable
-    (see common/jainam_client.py's module docstring, including the
-    CONFIRM BEFORE LIVE note on BSE segment IDs); passing multiple or
-    non-nearest --expiry-date values will raise the same "no instruments
-    found for expiry" error the Kite path raises for a genuinely delisted
-    expiry.
+    Only the nearest option expiry is ever resolvable (see
+    common/jainam_client.py's module docstring, including the CONFIRM
+    BEFORE LIVE note on BSE segment IDs); passing multiple or non-nearest
+    --expiry-date values will raise a "no instruments found for expiry"
+    error.
     """
-    kite = get_broker_client(broker, get_kite_client)
+    client = get_jainam_client()
 
     logger.info("Fetching BFO instrument master...")
-    instruments = fetch_instruments(kite)
+    instruments = fetch_instruments(client)
 
     if not expiry_dates:
         nearest_expiry = select_nearest_option_expiry(instruments)
@@ -708,7 +621,7 @@ def run(
     for expiry_date in expiry_dates:
         logger.info("Processing expiry %s...", expiry_date)
         results, spot, futures_price, T, future_row, futures_source = run_single_expiry(
-            kite, instruments, expiry_date, r=r, q=q, days_per_year=days_per_year, futures_expiry=futures_expiry
+            client, instruments, expiry_date, r=r, q=q, days_per_year=days_per_year, futures_expiry=futures_expiry
         )
         last_results = results
 
@@ -787,14 +700,6 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         default=0.013,
         help="Dividend yield for the spot-based Black-Scholes leg, annualized decimal (default: 0.013 = 1.3%%).",
     )
-    parser.add_argument(
-        "--broker",
-        choices=("kite", "jainam"),
-        default="kite",
-        help="Which broker to fetch data from. Default: kite. --broker jainam uses "
-        "common/jainam_client.py (JAINAM_* environment variables) and only resolves the "
-        "nearest option expiry -- see its module docstring.",
-    )
     return parser.parse_args(argv)
 
 
@@ -806,7 +711,6 @@ def main(argv: Optional[list] = None) -> int:
             r=args.r,
             q=args.q,
             futures_expiry=args.futures_expiry,
-            broker=args.broker,
         )
     except (EnvironmentError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -2,17 +2,14 @@
 jainam_client.py
 ==================
 
-Jainam (XTS-based) broker client, built to be a drop-in stand-in for
-kiteconnect.KiteConnect wherever this project's code takes a `kite`
-parameter: leg_lifecycle.py and both delta models only ever call
+Jainam (XTS-based) broker client -- the sole broker client this project
+trades through. leg_lifecycle.py and both delta models only ever call
 `.instruments(exchange)`, `.quote(keys)`, `.ltp(keys)`, `.place_order(...)`,
 `.order_history(order_id)`, and read the constants `VARIETY_REGULAR`,
 `PRODUCT_NRML`, `ORDER_TYPE_MARKET` off the client -- this class implements
-that exact surface backed by Jainam's XTS Connect API instead of Kite, so
-every strategy script, leg_lifecycle.py's stop-loss/re-entry engine, and
-both delta models' math/selection logic run completely unmodified against
-either broker. Nothing outside this file (and broker_client.py, which
-constructs it) knows or cares that Jainam isn't Kite.
+that exact surface backed by Jainam's XTS Connect API, so every strategy
+script, leg_lifecycle.py's stop-loss/re-entry engine, and both delta
+models' math/selection logic call a single, consistent client interface.
 
 Jainam white-labels Symphony Fintech's XTS Connect API -- same platform,
 same route table, as documented at developers.symphonyfintech.in. The
@@ -29,31 +26,29 @@ Talks to the documented REST endpoints directly with `requests`; does not
 vendor Symphony's own SDK (github.com/symphonyfintech/xts-pythonclient-api-sdk),
 since that repo carries no open-source license despite being public. No
 python-dotenv dependency either, unlike the reference project -- this
-project's existing convention (see get_kite_client() in nifty_delta_model.py
-/ sensex_delta_model.py) is plain environment variables, not a .env file,
-so JainamClient.from_env() follows that same convention.
+project's existing convention (see get_jainam_client() in
+nifty_delta_model.py / sensex_delta_model.py) is plain environment
+variables, not a .env file, so JainamClient.from_env() follows that same
+convention.
 
 Why only the nearest option expiry is ever fully resolved
 --------------------------------------------------------------------------
-Kite's instruments(exchange) is a single bulk dump of every NFO instrument,
-which is why fetch_instruments() in the delta models can cache it once and
-have select_nearest_option_expiry/select_option_chain_instruments/etc. do
-pure local DataFrame filtering with no further I/O. XTS has no equivalent
-bulk dump among the routes this account has verified -- only point lookups
-(list expiries for a symbol/series, list strikes for one expiry, resolve
-one option symbol at a time). Fully resolving *every* strike of *every*
-listed expiry just to build an equivalent bulk instruments() table would be
-hundreds of extra round trips for expiries nothing in this project ever
-uses. Since every strategy script here only ever trades the nearest weekly
-expiry, instruments() instead: (a) fully resolves every listed futures
-contract (there are only ever a handful), and (b) fully resolves the full
-CE/PE strike grid of the single nearest unexpired option expiry. That's
-exactly what select_nearest_option_expiry + select_option_chain_instruments
-will end up using anyway. Requesting a *different* expiry (only possible
-via the standalone --expiry-date override on the delta-model CLIs, not from
-any of the five live strategy scripts) raises the same "no instruments
-found for expiry" ValueError the Kite path already raises for a genuinely
-delisted expiry -- correctly refusing to guess, just for a different reason.
+XTS has no bulk instrument-dump route among the ones this account has
+verified -- only point lookups (list expiries for a symbol/series, list
+strikes for one expiry, resolve one option symbol at a time). Fully
+resolving *every* strike of *every* listed expiry just to build an
+equivalent bulk instruments() table would be hundreds of extra round trips
+for expiries nothing in this project ever uses. Since every strategy script
+here only ever trades the nearest weekly expiry, instruments() instead: (a)
+fully resolves every listed futures contract (there are only ever a
+handful), and (b) fully resolves the full CE/PE strike grid of the single
+nearest unexpired option expiry. That's exactly what
+select_nearest_option_expiry + select_option_chain_instruments will end up
+using anyway. Requesting a *different* expiry (only possible via the
+standalone --expiry-date override on the delta-model CLIs, not from any of
+the five live strategy scripts) raises the same "no instruments found for
+expiry" ValueError that a genuinely delisted expiry would -- correctly
+refusing to guess, just for a different reason.
 
 CONFIRM BEFORE LIVE -- built from API documentation and the patterns in
 this account's other Jainam integration, not verified against a live
@@ -75,10 +70,10 @@ every read call). Before trusting this for real trading:
     productType/orderType/orderSide values, timeInForce, the response
     shape and its OrderStatus vocabulary) follow commonly-documented XTS
     Interactive Order API conventions but are UNTESTED against a live
-    Jainam account. Test with --broker jainam in the default PAPER mode
-    first -- paper mode never calls place_order()/order_history() on any
-    broker, so it fully exercises the (verified-pattern) read side without
-    ever touching this unverified write side.
+    Jainam account. Test in the default PAPER mode first -- paper mode
+    never calls place_order()/order_history(), so it fully exercises the
+    (verified-pattern) read side without ever touching this unverified
+    write side.
 """
 
 from __future__ import annotations
@@ -123,17 +118,15 @@ def _fmt_expiry(d: date) -> str:
 
 
 class JainamClient:
-    """Kite-compatible client backed by Jainam's XTS Connect API.
+    """Broker client backed by Jainam's XTS Connect API.
 
     Construct via JainamClient.from_env() -- the constructor itself just
-    takes already-obtained tokens, mirroring KiteConnect's own
-    set_access_token() pattern.
+    takes already-obtained tokens.
     """
 
-    # Kite-compatible constants referenced by leg_lifecycle.py's execute_order.
-    # Values are self-consistent within this class only -- they're passed
-    # straight back into place_order() below, never compared against Kite's
-    # own literal values, so they don't need to match Kite's.
+    # Constants referenced by leg_lifecycle.py's execute_order. Values are
+    # self-consistent within this class only -- they're passed straight
+    # back into place_order() below.
     VARIETY_REGULAR = "regular"
     PRODUCT_NRML = "NRML"
     PRODUCT_MIS = "MIS"
@@ -153,10 +146,9 @@ class JainamClient:
     def from_env(cls) -> "JainamClient":
         """Build a client from JAINAM_* environment variables and log in.
 
-        Unlike Kite, XTS login is a direct appKey/secretKey POST with no
-        interactive browser step -- there is deliberately no Jainam
-        equivalent of kite_login_helper.py's daily manual login or session
-        cache; this logs in fresh each time a script starts.
+        XTS login is a direct, non-interactive appKey/secretKey POST, so
+        this logs in fresh each time a script starts -- no manual browser
+        login step and no session cache to manage.
         """
         base_url = os.environ.get("JAINAM_BASE_URL")
         market_api_key = os.environ.get("JAINAM_MARKET_API_KEY")
@@ -278,7 +270,7 @@ class JainamClient:
         }
 
     def instruments(self, exchange: str, use_cache: bool = True) -> list[dict]:
-        """Kite-shaped instrument rows for `exchange` ("NFO" or "BFO").
+        """Instrument rows for `exchange` ("NFO" or "BFO").
 
         Only the nearest unexpired option expiry's full CE/PE grid is
         resolved -- see the module docstring for why. All listed futures
@@ -341,13 +333,12 @@ class JainamClient:
     # --- quotes --------------------------------------------------------------
 
     def quote(self, keys: list[str]) -> dict:
-        """Kite-shaped quote() -- {key: {"last_price": ..., "depth": {}}}.
+        """quote() -- {key: {"last_price": ..., "depth": {}}}.
 
         depth is always empty: XTS's touchline response only demonstrably
         carries LastTradedPrice in this account's verified usage, so
         low-liquidity mid-price computation (nifty_delta_model.py's
-        _price_and_liquidity) always falls back to last_price for Jainam,
-        same as it would for any Kite quote with no resting bid/ask.
+        _price_and_liquidity) always falls back to last_price.
         """
         instruments_payload = []
         for key in keys:
@@ -397,7 +388,7 @@ class JainamClient:
 
         Only paper mode (the default everywhere in this project) is
         exercised in practice without --live; this path only runs when a
-        strategy script is launched with both --live and --broker jainam.
+        strategy script is launched with --live.
         """
         key = f"{exchange}:{tradingsymbol}"
         entry = self._symbol_map.get(key)
@@ -435,9 +426,10 @@ class JainamClient:
     def order_history(self, order_id: str) -> list[dict]:
         """CONFIRM BEFORE LIVE -- untested against a live Jainam session.
 
-        Normalizes XTS's OrderStatus vocabulary to Kite's ("COMPLETE" /
-        "REJECTED" / "CANCELLED") so fetch_fill_price() in leg_lifecycle.py
-        needs no broker-specific branching. Unrecognized statuses (e.g.
+        Normalizes XTS's OrderStatus vocabulary to this project's own
+        ("COMPLETE" / "REJECTED" / "CANCELLED") so fetch_fill_price() in
+        leg_lifecycle.py has one consistent vocabulary to check. Unrecognized
+        statuses (e.g.
         "New", "PartiallyFilled") pass through unmapped, which correctly
         tells the caller's poll loop to keep waiting rather than matching
         any terminal state by accident.
