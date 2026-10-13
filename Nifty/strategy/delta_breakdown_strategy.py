@@ -341,7 +341,12 @@ def run_selection_scan(client: JainamClient, lots: int, live: bool, max_reentrie
     a leg only becomes a position once it breaks out (see check_breakout)."""
     logger.info("=" * 70)
     logger.info("CONTRACT SELECTION starting...")
-    instruments = _retry_call(fetch_instruments, client, description="fetch_instruments")
+    # Skip an expiry that is today itself -- a breakout entry any time after
+    # 14:00 today could still be open and held overnight to tomorrow's
+    # 12:45 exit, so a contract expiring at today's 15:30 cutoff would
+    # already be settled mid-hold. Require strictly next week's expiry.
+    tomorrow = (datetime.now(IST) + timedelta(days=1)).date()
+    instruments = _retry_call(fetch_instruments, client, min_expiry=tomorrow, description="fetch_instruments")
     selection = select_entry_strikes(client, instruments)
 
     call_lot, put_lot = selection["call"]["lot_size"], selection["put"]["lot_size"]

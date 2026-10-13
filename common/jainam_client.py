@@ -138,7 +138,7 @@ class JainamClient:
         self.interactive_token = interactive_token
         self._session = requests.Session()
         self._index_list_cache: dict[int, dict[str, int]] = {}
-        self._instrument_cache: dict[str, list[dict]] = {}
+        self._instrument_cache: dict[tuple[str, date], list[dict]] = {}
         # "EXCHANGE:tradingsymbol_or_index_name" -> {"segment": int, "id": int}
         self._symbol_map: dict[str, dict] = {}
 
@@ -273,15 +273,22 @@ class JainamClient:
             "lot_size": int(result["LotSize"]),
         }
 
-    def instruments(self, exchange: str, use_cache: bool = True) -> list[dict]:
+    def instruments(self, exchange: str, use_cache: bool = True, min_expiry: date | None = None) -> list[dict]:
         """Instrument rows for `exchange` ("NFO" or "BFO").
 
-        Only the nearest unexpired option expiry's full CE/PE grid is
-        resolved -- see the module docstring for why. All listed futures
-        contracts are fully resolved (there are only ever a few).
+        Only one option expiry's full CE/PE grid is resolved -- see the
+        module docstring for why. That's the nearest unexpired expiry on or
+        after `min_expiry` (default: today), so a fresh overnight entry can
+        require min_expiry=tomorrow to skip an expiry that is today itself
+        (which wouldn't leave anything to hold overnight) and get next
+        week's grid instead. All listed futures contracts are fully
+        resolved regardless (there are only ever a few).
         """
-        if use_cache and exchange in self._instrument_cache:
-            return self._instrument_cache[exchange]
+        today = datetime.now().date()
+        floor = min_expiry if min_expiry is not None else today
+        cache_key = (exchange, floor)
+        if use_cache and cache_key in self._instrument_cache:
+            return self._instrument_cache[cache_key]
 
         underlying = _UNDERLYING_BY_EXCHANGE.get(exchange)
         if underlying is None:
@@ -307,10 +314,9 @@ class JainamClient:
             )
 
         opt_expiries = sorted(self._get_expiries(symbol, fo_segment, "OPTIDX"))
-        today = datetime.now().date()
-        unexpired = [e for e in opt_expiries if e >= today]
+        unexpired = [e for e in opt_expiries if e >= floor]
         if not unexpired:
-            raise BrokerError(f"No unexpired {symbol} option expiries returned by Jainam.")
+            raise BrokerError(f"No {symbol} option expiries on or after {floor} returned by Jainam.")
         nearest_expiry = unexpired[0]
 
         strikes = self._get_strike_list(symbol, fo_segment, nearest_expiry)
@@ -331,7 +337,7 @@ class JainamClient:
                 )
 
         if use_cache:
-            self._instrument_cache[exchange] = rows
+            self._instrument_cache[cache_key] = rows
         return rows
 
     # --- quotes --------------------------------------------------------------

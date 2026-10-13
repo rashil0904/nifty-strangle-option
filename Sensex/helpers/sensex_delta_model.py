@@ -127,8 +127,8 @@ BFO_EXCHANGE = "BFO"  # BSE F&O segment: where SENSEX options/futures trade
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Session-level cache for the (large) instrument master, keyed by exchange.
-_instrument_cache: dict[str, pd.DataFrame] = {}
+# Session-level cache for the (large) instrument master, keyed by (exchange, min_expiry).
+_instrument_cache: dict[tuple[str, Optional[date]], pd.DataFrame] = {}
 
 
 # --------------------------------------------------------------------------
@@ -149,13 +149,25 @@ def get_jainam_client() -> JainamClient:
 # --------------------------------------------------------------------------
 
 
-def fetch_instruments(client: JainamClient, exchange: str = BFO_EXCHANGE, use_cache: bool = True) -> pd.DataFrame:
-    """Fetch (and cache for the session) the instrument master for `exchange`."""
-    if use_cache and exchange in _instrument_cache:
-        return _instrument_cache[exchange]
+def fetch_instruments(
+    client: JainamClient,
+    exchange: str = BFO_EXCHANGE,
+    use_cache: bool = True,
+    min_expiry: Optional[date] = None,
+) -> pd.DataFrame:
+    """Fetch (and cache for the session) the instrument master for `exchange`.
+
+    min_expiry, if given, is passed through to JainamClient.instruments() to
+    require the resolved option grid's expiry be on or after that date --
+    e.g. min_expiry=tomorrow to skip an expiry that is today itself when
+    selecting strikes for a fresh overnight entry.
+    """
+    cache_key = (exchange, min_expiry)
+    if use_cache and cache_key in _instrument_cache:
+        return _instrument_cache[cache_key]
 
     try:
-        raw = client.instruments(exchange)
+        raw = client.instruments(exchange, min_expiry=min_expiry)
     except BrokerAuthError as exc:
         raise RuntimeError(
             "Jainam credentials expired or invalid while fetching instruments. Regenerate them and retry."
@@ -169,7 +181,7 @@ def fetch_instruments(client: JainamClient, exchange: str = BFO_EXCHANGE, use_ca
     df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
 
     if use_cache:
-        _instrument_cache[exchange] = df
+        _instrument_cache[cache_key] = df
     return df
 
 

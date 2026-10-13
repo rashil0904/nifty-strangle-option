@@ -348,7 +348,11 @@ def run_entry_scan(client: JainamClient, lots: int, live: bool, max_reentries: O
     """Full 11am entry sequence: select strikes, place both legs, build fresh state."""
     logger.info("=" * 70)
     logger.info("ENTRY SCAN starting...")
-    instruments = _retry_call(fetch_instruments, client, description="fetch_instruments")
+    # Skip an expiry that is today itself -- entering a contract that expires
+    # before tonight's hold is even finished would leave nothing to carry
+    # overnight, so require strictly next week's expiry in that case.
+    tomorrow = (datetime.now(IST) + timedelta(days=1)).date()
+    instruments = _retry_call(fetch_instruments, client, min_expiry=tomorrow, description="fetch_instruments")
     selection = select_entry_strikes(client, instruments)
 
     call_lot, put_lot = selection["call"]["lot_size"], selection["put"]["lot_size"]
