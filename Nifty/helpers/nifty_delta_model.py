@@ -110,7 +110,7 @@ from jainam_client import JainamClient
 IST = ZoneInfo("Asia/Kolkata")
 EXPIRY_SETTLEMENT_TIME = dtime(15, 30)  # NSE F&O expiry cutoff, IST
 DAYS_PER_YEAR = 365.0  # calendar-day convention; swap for a trading-day count later
-MAX_INSTRUMENTS_PER_QUOTE = 500  # per-call cap for quote() batching
+MAX_INSTRUMENTS_PER_QUOTE = 50  # per-call cap for quote() batching -- verified live limit (e-quotes-0003)
 IV_LOWER_BOUND = 0.01
 IV_UPPER_BOUND = 3.0
 VOL_SOLVER_XTOL = 1e-6

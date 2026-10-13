@@ -171,7 +171,7 @@ class JainamClient:
             )
 
         session = requests.Session()
-        market_token = _login(session, base_url, "/apimarketdata/auth/login", market_api_key, market_api_secret, source)
+        market_token = _login(session, base_url, "/apibinarymarketdata/auth/login", market_api_key, market_api_secret, source)
         interactive_token = _login(
             session, base_url, "/interactive/user/session", interactive_api_key, interactive_api_secret, source
         )
@@ -198,7 +198,7 @@ class JainamClient:
     def _index_list(self, exchange_segment: int) -> dict[str, int]:
         """Name -> exchangeInstrumentID for all indices in a segment."""
         if exchange_segment not in self._index_list_cache:
-            data = self._market_get("/apimarketdata/instruments/indexlist", {"exchangeSegment": exchange_segment})
+            data = self._market_get("/apibinarymarketdata/instruments/indexlist", {"exchangeSegment": exchange_segment})
             mapping = {}
             for entry in data["result"]["indexList"]:
                 name, _, instrument_id = entry.rpartition("_")
@@ -222,22 +222,25 @@ class JainamClient:
 
     def _get_expiries(self, symbol: str, fo_segment: int, series: str) -> list[date]:
         data = self._market_get(
-            "/apimarketdata/instruments/instrument/expiryDate",
+            "/apibinarymarketdata/instruments/instrument/expiryDate",
             {"exchangeSegment": fo_segment, "series": series, "symbol": symbol},
         )
         return [datetime.fromisoformat(e).date() for e in data["result"]]
 
     def _resolve_future(self, symbol: str, fo_segment: int, expiry: date) -> dict:
         data = self._market_get(
-            "/apimarketdata/instruments/instrument/futureSymbol",
+            "/apibinarymarketdata/instruments/instrument/futureSymbol",
             {"exchangeSegment": fo_segment, "series": "FUTIDX", "symbol": symbol, "expiryDate": _fmt_expiry(expiry)},
         )
-        result = data["result"]
+        results = data["result"]
+        if not results:
+            raise BrokerError(f"No {symbol} future found for expiry={expiry}.")
+        result = results[0]
         return {"tradingsymbol": result["Description"], "instrument_id": int(result["ExchangeInstrumentID"])}
 
     def _get_strike_list(self, symbol: str, fo_segment: int, expiry: date) -> list[float]:
         data = self._market_get(
-            "/apimarketdata/instruments/instrument/strikePrice",
+            "/apibinarymarketdata/instruments/instrument/strikePrice",
             {
                 "exchangeSegment": fo_segment,
                 "series": "OPTIDX",
@@ -250,7 +253,7 @@ class JainamClient:
 
     def _resolve_option(self, symbol: str, fo_segment: int, expiry: date, strike: float, option_type: str) -> dict:
         data = self._market_get(
-            "/apimarketdata/instruments/instrument/optionsymbol",
+            "/apibinarymarketdata/instruments/instrument/optionsymbol",
             {
                 "exchangeSegment": fo_segment,
                 "series": "OPTIDX",
@@ -260,9 +263,10 @@ class JainamClient:
                 "strikePrice": strike,
             },
         )
-        result = data.get("result")
-        if not result:
+        results = data.get("result")
+        if not results:
             raise BrokerError(f"No {symbol} {option_type} found for strike={strike} expiry={expiry}.")
+        result = results[0]
         return {
             "tradingsymbol": result["Description"],
             "instrument_id": int(result["ExchangeInstrumentID"]),
@@ -333,7 +337,11 @@ class JainamClient:
     # --- quotes --------------------------------------------------------------
 
     def quote(self, keys: list[str]) -> dict:
-        """quote() -- {key: {"last_price": ..., "depth": {}}}.
+        """quote() -- {key: {"last_price": ..., "depth": {}}}, omitting any key
+        XTS returned no quote for (e.g. a strike with zero trades) rather than
+        raising -- callers that need every key present (ltp()) check for gaps
+        themselves; callers scanning a whole chain (fetch_option_chain_quotes)
+        already tolerate and skip individual missing strikes.
 
         depth is always empty: XTS's touchline response only demonstrably
         carries LastTradedPrice in this account's verified usage, so
@@ -348,7 +356,7 @@ class JainamClient:
             instruments_payload.append({"exchangeSegment": entry["segment"], "exchangeInstrumentID": entry["id"]})
 
         data = self._market_post(
-            "/apimarketdata/instruments/quotes",
+            "/apibinarymarketdata/instruments/quotes",
             {"instruments": instruments_payload, "xtsMessageCode": 1501, "publishFormat": "JSON"},
         )
         quotes_by_id = {}
@@ -364,12 +372,15 @@ class JainamClient:
             entry = self._symbol_map[key]
             q = quotes_by_id.get(entry["id"])
             if q is None:
-                raise BrokerError(f"No quote returned for {key}.")
+                continue
             result[key] = {"last_price": float(q["LastTradedPrice"]), "depth": {}}
         return result
 
     def ltp(self, keys: list[str]) -> dict:
         quotes = self.quote(keys)
+        missing = [key for key in keys if key not in quotes]
+        if missing:
+            raise BrokerError(f"No quote returned for {', '.join(missing)}.")
         return {key: {"last_price": q["last_price"]} for key, q in quotes.items()}
 
     # --- order placement / status (UNVERIFIED -- see module docstring) -----
