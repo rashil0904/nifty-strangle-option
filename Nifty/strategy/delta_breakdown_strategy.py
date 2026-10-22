@@ -36,7 +36,7 @@ Strategy summary
    the cycle. This continues overnight and resumes polling once the market
    reopens.
 
-5. 12:45 IST the next trading day -- unconditional exit: any leg still
+5. 11:15 IST the next trading day -- unconditional exit: any leg still
    "open" is bought back regardless of P&L. Legs that are flat (no entry,
    or stopped out with the re-entry cap exhausted) need no action.
 
@@ -72,7 +72,7 @@ assumed)
 
 2. Order product is NRML (carry-forward), not MIS (intraday) -- deliberate
    and safety-critical, since a breakout entry can happen as late as 15:29
-   on day D and the position may be held to 12:45 on day D+1.
+   on day D and the position may be held to 11:15 on day D+1.
 
 3. No NSE holiday calendar is incorporated -- only weekends are skipped
    when computing the next trading day. A mid-week exchange holiday isn't
@@ -170,7 +170,7 @@ LOG_FILE = "breakdown_strategy_log.txt"
 SELECTION_TIME = dtime(10, 45)
 TRACKED_LOW_FREEZE_TIME = dtime(11, 29, 59)
 BREAKOUT_START_TIME = dtime(11, 30)
-EXIT_TIME = dtime(12, 45)  # on the next trading day after selection
+EXIT_TIME = dtime(11, 15)  # on the next trading day after selection
 
 TARGET_DELTA_CALL = 0.30
 TARGET_DELTA_PUT = -0.30
@@ -239,7 +239,7 @@ def next_selection_datetime(now: datetime) -> datetime:
 
 
 def exit_deadline_from_selection(selection_dt: datetime) -> datetime:
-    """12:45 IST on the next trading day after selection_dt's date."""
+    """11:15 IST on the next trading day after selection_dt's date."""
     return deadline_next_trading_day(selection_dt.date(), EXIT_TIME)
 
 
@@ -342,8 +342,8 @@ def run_selection_scan(client: JainamClient, lots: int, live: bool, max_reentrie
     logger.info("=" * 70)
     logger.info("CONTRACT SELECTION starting...")
     # Skip an expiry that is today itself -- a breakout entry any time after
-    # 14:00 today could still be open and held overnight to tomorrow's
-    # 12:45 exit, so a contract expiring at today's 15:30 cutoff would
+    # 11:30 today could still be open and held overnight to tomorrow's
+    # 11:15 exit, so a contract expiring at today's 15:30 cutoff would
     # already be settled mid-hold. Require strictly next week's expiry.
     tomorrow = (datetime.now(IST) + timedelta(days=1)).date()
     instruments = _retry_call(fetch_instruments, client, min_expiry=tomorrow, description="fetch_instruments")
@@ -633,7 +633,7 @@ def run(args: argparse.Namespace) -> None:
             logger.warning(
                 "This invocation passed --live=%s but the active cycle was started with live=%s -- "
                 "using the ORIGINAL cycle's setting for consistency. Let this cycle finish (it exits "
-                "automatically at 12:45pm) before starting a new one in a different mode.",
+                "automatically at 11:15am) before starting a new one in a different mode.",
                 args.live, live,
             )
         if live:
