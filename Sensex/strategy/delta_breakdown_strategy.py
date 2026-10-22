@@ -10,18 +10,18 @@ are independent and never touch each other's positions or state.
 
 Strategy summary
 --------------------------------------------------------------------------
-1. 09:45 IST -- contract selection (locked for the day): compute Black-76
+1. 10:45 IST -- contract selection (locked for the day): compute Black-76
    delta for the nearest weekly expiry's full chain (reusing
    sensex_delta_model.py's math/data functions) and lock in the call strike
    closest to +0.30 delta and the put strike closest to -0.30 delta. These
    two contracts do not change again for the rest of the cycle, even if the
    0.3-delta strike shifts later in the day.
 
-2. 09:45-13:59:59 IST -- tracking window: poll each locked contract's LTP
+2. 10:45-11:29:59 IST -- tracking window: poll each locked contract's LTP
    on --poll-seconds and maintain a running minimum, tracked_low, per leg.
-   At exactly 13:59:59, tracked_low is frozen and never updated again.
+   At exactly 11:29:59, tracked_low is frozen and never updated again.
 
-3. 14:00 IST onward -- breakout entry: keep polling; the first time (and
+3. 11:30 IST onward -- breakout entry: keep polling; the first time (and
    only the first time) a leg's LTP drops strictly below its frozen
    tracked_low, SELL that leg at market and record the fill as entry_price.
    A leg that never breaks its tracked_low before market close (15:30) that
@@ -167,9 +167,9 @@ from leg_lifecycle import (
 STATE_FILE = "sensex_breakdown_strategy_state.json"
 LOG_FILE = "sensex_breakdown_strategy_log.txt"
 
-SELECTION_TIME = dtime(9, 45)
-TRACKED_LOW_FREEZE_TIME = dtime(13, 59, 59)
-BREAKOUT_START_TIME = dtime(14, 0)
+SELECTION_TIME = dtime(10, 45)
+TRACKED_LOW_FREEZE_TIME = dtime(11, 29, 59)
+BREAKOUT_START_TIME = dtime(11, 30)
 EXIT_TIME = dtime(12, 45)  # on the next trading day after selection
 
 TARGET_DELTA_CALL = 0.30
