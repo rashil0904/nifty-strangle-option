@@ -11,7 +11,7 @@ At 11:00 IST, scan the nearest weekly NIFTY option chain, compute Black-76
 delta for every strike (reusing nifty_delta_model.py's math/data functions),
 and SELL 1 lot each of the call strike closest to +0.30 delta and the put
 strike closest to -0.30 delta. Each leg is then monitored independently
-until 10:45 IST the next trading day:
+until 10:30 IST the next trading day:
 
   - Stop-loss: if a leg's LTP reaches entry_price * 1.20, buy it back
     immediately and start watching for a re-entry.
@@ -19,7 +19,7 @@ until 10:45 IST the next trading day:
     original entry_price, sell it again at market. Capped at --max-reentries
     re-entries per leg (default 1: re-enter once, then stay flat for the
     rest of the cycle if it stops out again).
-  - At 10:45 next day, whatever is still open gets bought back regardless
+  - At 10:30 next day, whatever is still open gets bought back regardless
     of P&L; legs that are flat (watching_for_reentry or capped) need no
     action.
 
@@ -58,7 +58,7 @@ assumed)
 
 2. Order product is NRML (carry-forward), not MIS (intraday). This is
    deliberate and safety-critical: these positions are explicitly held
-   overnight (11am entry to next-day 10:45am exit), and MIS positions are
+   overnight (11am entry to next-day 10:30am exit), and MIS positions are
    auto-squared-off by the broker near end-of-day, which would silently
    break the whole strategy.
 
@@ -75,7 +75,7 @@ assumed)
    limited to --lots, --poll-seconds, --max-reentries, --live per spec.
 
 5. One process instance manages exactly one entry-to-exit cycle
-   (~11am to ~10:45am the next day) and then exits. For continuous
+   (~11am to ~10:30am the next day) and then exits. For continuous
    day-after-day operation, relaunch it each morning (or run it under a
    supervisor); it will auto-wait for the next 11:00 entry if launched
    early, or resume an in-progress cycle from strategy_state.json if one
@@ -157,7 +157,7 @@ STATE_FILE = "strategy_state.json"
 LOG_FILE = "strategy_log.txt"
 
 ENTRY_TIME = dtime(11, 0)
-EXIT_TIME = dtime(10, 45)  # on the next trading day after entry
+EXIT_TIME = dtime(10, 30)  # on the next trading day after entry
 
 TARGET_DELTA_CALL = 0.30
 TARGET_DELTA_PUT = -0.30
@@ -225,7 +225,7 @@ def next_entry_datetime(now: datetime) -> datetime:
 
 
 def exit_deadline_from_entry(entry_dt: datetime) -> datetime:
-    """10:45 IST on the next trading day after entry_dt's date."""
+    """10:30 IST on the next trading day after entry_dt's date."""
     return deadline_next_trading_day(entry_dt.date(), EXIT_TIME)
 
 
@@ -557,7 +557,7 @@ def run(args: argparse.Namespace) -> None:
             logger.warning(
                 "This invocation passed --live=%s but the active cycle was started with live=%s -- "
                 "using the ORIGINAL cycle's setting for consistency. Let this cycle finish (it exits "
-                "automatically at 10:45am) before starting a new one in a different mode.",
+                "automatically at 10:30am) before starting a new one in a different mode.",
                 args.live, live,
             )
         if live:
