@@ -12,3 +12,9 @@ strategy_log.txt
 # Local environment / credentials -- never commit these
 .env
 .kite_session.json
+
+.jainam_session.json*
+
+# Archived paper-trading runs
+paper_archive/
+cron_*.log

@@ -78,7 +78,9 @@ every read call). Before trusting this for real trading:
 
 from __future__ import annotations
 
+import json
 import os
+import time
 import uuid
 from datetime import date, datetime
 
@@ -97,12 +99,15 @@ NSE_FO_SEGMENT = 2  # verified: used for NIFTY futures/options
 BSE_CM_SEGMENT = 11
 BSE_FO_SEGMENT = 12
 
+# The Interactive (order) API takes the segment as a string name, not the market-data integer.
+_ORDER_SEGMENT_NAME = {NSE_CM_SEGMENT: "NSECM", NSE_FO_SEGMENT: "NSEFO", BSE_CM_SEGMENT: "BSECM", BSE_FO_SEGMENT: "BSEFO"}
+
 # NFO/BFO (this project's own exchange constants) -> (underlying symbol, F&O
 # segment, cash segment, spot index name). The spot index name is what XTS's
 # indexlist endpoint is expected to key SENSEX/NIFTY 50 under.
 _UNDERLYING_BY_EXCHANGE = {
-    "NFO": {"symbol": "NIFTY", "fo_segment": NSE_FO_SEGMENT, "cm_segment": NSE_CM_SEGMENT, "spot_index_name": "NIFTY 50"},
-    "BFO": {"symbol": "SENSEX", "fo_segment": BSE_FO_SEGMENT, "cm_segment": BSE_CM_SEGMENT, "spot_index_name": "SENSEX"},
+    "NFO": {"symbol": "NIFTY", "fut_series": "FUTIDX", "opt_series": "OPTIDX", "fo_segment": NSE_FO_SEGMENT, "cm_segment": NSE_CM_SEGMENT, "spot_index_name": "NIFTY 50"},
+    "BFO": {"symbol": "SENSEX", "fut_series": "IF", "opt_series": "IO", "fo_segment": BSE_FO_SEGMENT, "cm_segment": BSE_CM_SEGMENT, "spot_index_name": "SENSEX"},
 }
 
 # Spot-quote key prefixes ("NSE:NIFTY 50", "BSE:SENSEX") map to the
@@ -110,6 +115,74 @@ _UNDERLYING_BY_EXCHANGE = {
 # than NFO/BFO.
 _CASH_SEGMENT_BY_PREFIX = {"NSE": NSE_CM_SEGMENT, "BSE": BSE_CM_SEGMENT}
 _INDEX_NAME_BY_CASH_SEGMENT = {NSE_CM_SEGMENT: "NIFTY 50", BSE_CM_SEGMENT: "SENSEX"}
+
+
+# --------------------------------------------------------------------------
+# Shared login session
+#
+# XTS allows only one live token per API key: logging in again invalidates the
+# previous token ("Invalid Token", e-session-0007). Several strategy scripts run
+# as separate processes with the same keys, so they share one token pair through
+# a small cache file instead of each logging in on its own. A call that fails
+# with an invalid token re-logs in under a file lock (or adopts a token another
+# process already refreshed) and retries once.
+# --------------------------------------------------------------------------
+
+_SESSION_FILE = os.environ.get("JAINAM_SESSION_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", ".jainam_session.json"
+)
+_LOCK_FILE = _SESSION_FILE + ".lock"
+_LOCK_TIMEOUT_SECONDS = 30
+_LOCK_STALE_SECONDS = 60
+
+
+class _FileLock:
+    def __enter__(self):
+        deadline = time.time() + _LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(_LOCK_FILE) > _LOCK_STALE_SECONDS:
+                        os.remove(_LOCK_FILE)
+                        continue
+                except OSError:
+                    pass
+                if time.time() > deadline:
+                    raise BrokerError(f"Timed out waiting for the Jainam session lock {_LOCK_FILE}.")
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        try:
+            os.remove(_LOCK_FILE)
+        except OSError:
+            pass
+
+
+def _read_session_cache(base_url: str) -> dict | None:
+    try:
+        with open(_SESSION_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if data.get("base_url") != base_url or not data.get("market_token") or not data.get("interactive_token"):
+        return None
+    return data
+
+
+def _write_session_cache(base_url: str, market_token: str, interactive_token: str) -> None:
+    tmp = _SESSION_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"base_url": base_url, "market_token": market_token, "interactive_token": interactive_token}, fh)
+    os.replace(tmp, _SESSION_FILE)
+
+
+def _is_invalid_token(exc: BrokerError) -> bool:
+    text = str(exc)
+    return isinstance(exc, BrokerAuthError) or "Invalid Token" in text or "e-session" in text
 
 
 def _fmt_expiry(d: date) -> str:
@@ -131,12 +204,16 @@ class JainamClient:
     PRODUCT_NRML = "NRML"
     PRODUCT_MIS = "MIS"
     ORDER_TYPE_MARKET = "MARKET"
+    ORDER_TYPE_STOP_MARKET = "StopMarket"
+    ORDER_TYPE_STOP_LIMIT = "StopLimit"
 
     def __init__(self, base_url: str, market_token: str, interactive_token: str):
         self.base_url = base_url.rstrip("/")
         self.market_token = market_token
         self.interactive_token = interactive_token
         self._session = requests.Session()
+        # Trading account the orders are placed under (JAINAM_CLIENT_ID); sent as clientID on order calls.
+        self.client_id: str | None = None
         self._index_list_cache: dict[int, dict[str, int]] = {}
         self._instrument_cache: dict[tuple[str, date], list[dict]] = {}
         # "EXCHANGE:tradingsymbol_or_index_name" -> {"segment": int, "id": int}
@@ -171,27 +248,70 @@ class JainamClient:
             )
 
         session = requests.Session()
-        market_token = _login(session, base_url, "/apibinarymarketdata/auth/login", market_api_key, market_api_secret, source)
-        interactive_token = _login(
-            session, base_url, "/interactive/user/session", interactive_api_key, interactive_api_secret, source
-        )
-        client = cls(base_url=base_url, market_token=market_token, interactive_token=interactive_token)
+        client = cls(base_url=base_url, market_token="", interactive_token="")
         client._session = session
+        client.client_id = os.environ.get("JAINAM_CLIENT_ID") or None
+        client._creds = {
+            "market": ("/apibinarymarketdata/auth/login", market_api_key, market_api_secret, source),
+            "interactive": ("/interactive/user/session", interactive_api_key, interactive_api_secret, source),
+        }
+        # Reuse the shared token pair if another process already logged in; otherwise log in once
+        # (under the lock, so concurrent starts don't each log in and invalidate one another).
+        with _FileLock():
+            cached = _read_session_cache(base_url)
+            if cached:
+                client.market_token = cached["market_token"]
+                client.interactive_token = cached["interactive_token"]
+            else:
+                client.market_token = _login(session, base_url, *client._creds["market"])
+                client.interactive_token = _login(session, base_url, *client._creds["interactive"])
+                _write_session_cache(base_url, client.market_token, client.interactive_token)
         return client
+
+    def _refresh_token(self, kind: str, stale_token: str) -> None:
+        """Replace an invalid `kind` ("market"/"interactive") token: adopt one another process already
+        refreshed, else log in again and share the new token."""
+        with _FileLock():
+            cached = _read_session_cache(self.base_url)
+            tokens = {"market": self.market_token, "interactive": self.interactive_token}
+            if cached and cached[f"{kind}_token"] != stale_token:
+                tokens[kind] = cached[f"{kind}_token"]
+            else:
+                tokens[kind] = _login(self._session, self.base_url, *self._creds[kind])
+            other = "interactive" if kind == "market" else "market"
+            if cached:
+                tokens[other] = cached[f"{other}_token"]
+            self.market_token, self.interactive_token = tokens["market"], tokens["interactive"]
+            _write_session_cache(self.base_url, self.market_token, self.interactive_token)
+
+    def _authed(self, kind: str, call):
+        """Run call(token); on an invalid-token failure refresh that token and retry once."""
+        token = self.market_token if kind == "market" else self.interactive_token
+        try:
+            return call(token)
+        except BrokerError as exc:
+            if not _is_invalid_token(exc):
+                raise
+            self._refresh_token(kind, token)
+            token = self.market_token if kind == "market" else self.interactive_token
+            return call(token)
 
     # --- low-level request helpers ----------------------------------------
 
     def _market_get(self, path: str, params: dict) -> dict:
-        return _request(self._session, "GET", self.base_url, path, self.market_token, params=params)
+        return self._authed("market", lambda t: _request(self._session, "GET", self.base_url, path, t, params=params))
 
     def _market_post(self, path: str, body: dict) -> dict:
-        return _request(self._session, "POST", self.base_url, path, self.market_token, json_body=body)
+        return self._authed("market", lambda t: _request(self._session, "POST", self.base_url, path, t, json_body=body))
 
     def _interactive_get(self, path: str, params: dict) -> dict:
-        return _request(self._session, "GET", self.base_url, path, self.interactive_token, params=params)
+        return self._authed("interactive", lambda t: _request(self._session, "GET", self.base_url, path, t, params=params))
+
+    def _interactive_delete(self, path: str, params: dict) -> dict:
+        return self._authed("interactive", lambda t: _request(self._session, "DELETE", self.base_url, path, t, params=params))
 
     def _interactive_post(self, path: str, body: dict) -> dict:
-        return _request(self._session, "POST", self.base_url, path, self.interactive_token, json_body=body)
+        return self._authed("interactive", lambda t: _request(self._session, "POST", self.base_url, path, t, json_body=body))
 
     # --- index list / spot resolution --------------------------------------
 
@@ -227,10 +347,10 @@ class JainamClient:
         )
         return [datetime.fromisoformat(e).date() for e in data["result"]]
 
-    def _resolve_future(self, symbol: str, fo_segment: int, expiry: date) -> dict:
+    def _resolve_future(self, symbol: str, fo_segment: int, expiry: date, series: str) -> dict:
         data = self._market_get(
             "/apibinarymarketdata/instruments/instrument/futureSymbol",
-            {"exchangeSegment": fo_segment, "series": "FUTIDX", "symbol": symbol, "expiryDate": _fmt_expiry(expiry)},
+            {"exchangeSegment": fo_segment, "series": series, "symbol": symbol, "expiryDate": _fmt_expiry(expiry)},
         )
         results = data["result"]
         if not results:
@@ -238,12 +358,12 @@ class JainamClient:
         result = results[0]
         return {"tradingsymbol": result["Description"], "instrument_id": int(result["ExchangeInstrumentID"])}
 
-    def _get_strike_list(self, symbol: str, fo_segment: int, expiry: date) -> list[float]:
+    def _get_strike_list(self, symbol: str, fo_segment: int, expiry: date, series: str) -> list[float]:
         data = self._market_get(
             "/apibinarymarketdata/instruments/instrument/strikePrice",
             {
                 "exchangeSegment": fo_segment,
-                "series": "OPTIDX",
+                "series": series,
                 "symbol": symbol,
                 "expiryDate": _fmt_expiry(expiry),
                 "optionType": "CE",
@@ -251,12 +371,14 @@ class JainamClient:
         )
         return sorted({float(s) for s in data["result"]})
 
-    def _resolve_option(self, symbol: str, fo_segment: int, expiry: date, strike: float, option_type: str) -> dict:
+    def _resolve_option(
+        self, symbol: str, fo_segment: int, expiry: date, strike: float, option_type: str, series: str
+    ) -> dict:
         data = self._market_get(
             "/apibinarymarketdata/instruments/instrument/optionsymbol",
             {
                 "exchangeSegment": fo_segment,
-                "series": "OPTIDX",
+                "series": series,
                 "symbol": symbol,
                 "expiryDate": _fmt_expiry(expiry),
                 "optionType": option_type,
@@ -294,12 +416,13 @@ class JainamClient:
         if underlying is None:
             raise BrokerError(f"Unknown exchange {exchange!r} -- expected 'NFO' or 'BFO'.")
         symbol, fo_segment = underlying["symbol"], underlying["fo_segment"]
+        fut_series, opt_series = underlying["fut_series"], underlying["opt_series"]
 
         rows: list[dict] = []
 
-        fut_expiries = self._get_expiries(symbol, fo_segment, "FUTIDX")
+        fut_expiries = sorted(set(self._get_expiries(symbol, fo_segment, fut_series)))
         for expiry in fut_expiries:
-            fut = self._resolve_future(symbol, fo_segment, expiry)
+            fut = self._resolve_future(symbol, fo_segment, expiry, fut_series)
             key = f"{exchange}:{fut['tradingsymbol']}"
             self._symbol_map[key] = {"segment": fo_segment, "id": fut["instrument_id"]}
             rows.append(
@@ -313,16 +436,16 @@ class JainamClient:
                 }
             )
 
-        opt_expiries = sorted(self._get_expiries(symbol, fo_segment, "OPTIDX"))
+        opt_expiries = sorted(self._get_expiries(symbol, fo_segment, opt_series))
         unexpired = [e for e in opt_expiries if e >= floor]
         if not unexpired:
             raise BrokerError(f"No {symbol} option expiries on or after {floor} returned by Jainam.")
         nearest_expiry = unexpired[0]
 
-        strikes = self._get_strike_list(symbol, fo_segment, nearest_expiry)
+        strikes = self._get_strike_list(symbol, fo_segment, nearest_expiry, opt_series)
         for strike in strikes:
             for option_type in ("CE", "PE"):
-                opt = self._resolve_option(symbol, fo_segment, nearest_expiry, strike, option_type)
+                opt = self._resolve_option(symbol, fo_segment, nearest_expiry, strike, option_type, opt_series)
                 key = f"{exchange}:{opt['tradingsymbol']}"
                 self._symbol_map[key] = {"segment": fo_segment, "id": opt["instrument_id"]}
                 rows.append(
@@ -400,6 +523,8 @@ class JainamClient:
         quantity: int,
         product: str,
         order_type: str,
+        stop_price: float = 0,
+        limit_price: float = 0,
     ) -> str:
         """CONFIRM BEFORE LIVE -- untested against a live Jainam session.
 
@@ -415,7 +540,7 @@ class JainamClient:
                 "can be placed for it."
             )
         body = {
-            "exchangeSegment": entry["segment"],
+            "exchangeSegment": _ORDER_SEGMENT_NAME[entry["segment"]],
             "exchangeInstrumentID": entry["id"],
             "productType": product,
             "orderType": order_type,
@@ -423,15 +548,24 @@ class JainamClient:
             "timeInForce": "DAY",
             "disclosedQuantity": 0,
             "orderQuantity": quantity,
-            "limitPrice": 0,
-            "stopPrice": 0,
+            "limitPrice": limit_price,
+            "stopPrice": stop_price,
             "orderUniqueIdentifier": uuid.uuid4().hex[:20],
         }
+        if self.client_id:
+            body["clientID"] = self.client_id
         data = self._interactive_post("/interactive/orders", body)
         try:
             return str(data["result"]["AppOrderID"])
         except KeyError as exc:
             raise BrokerError(f"Order placement response did not contain AppOrderID: {data}") from exc
+
+    def cancel_order(self, order_id: str) -> None:
+        """Cancel a resting order (used for the broker-side stop-loss). UNVERIFIED against a live session."""
+        params = {"appOrderID": order_id}
+        if self.client_id:
+            params["clientID"] = self.client_id
+        self._interactive_delete("/interactive/orders", params)
 
     _STATUS_MAP = {
         "Filled": "COMPLETE",
@@ -451,7 +585,10 @@ class JainamClient:
         tells the caller's poll loop to keep waiting rather than matching
         any terminal state by accident.
         """
-        data = self._interactive_get("/interactive/orders", {"appOrderID": order_id})
+        params = {"appOrderID": order_id}
+        if self.client_id:
+            params["clientID"] = self.client_id
+        data = self._interactive_get("/interactive/orders", params)
         result = data.get("result")
         rows = result if isinstance(result, list) else [result] if result else []
         history = []
