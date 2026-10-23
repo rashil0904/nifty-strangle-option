@@ -25,7 +25,8 @@ Strategy summary
    only the first time) a leg's LTP drops strictly below its frozen
    tracked_low, SELL that leg at market and record the fill as entry_price.
    A leg that never breaks its tracked_low before market close (15:30) that
-   day is marked "no entry" and skipped for the rest of the cycle.
+   day is NOT dropped: it keeps watching the same frozen low on the next trading day from the
+   open (a gap-down open below the low sells at the open) until the exit deadline.
 
 4. Stop-loss / re-entry (identical mechanics to delta_strangle_strategy.py,
    different thresholds/timing): once a leg is open, a stop-loss at
@@ -39,6 +40,9 @@ Strategy summary
 5. 12:45 IST the next trading day -- unconditional exit: any leg still
    "open" is bought back regardless of P&L. Legs that are flat (no entry,
    or stopped out with the re-entry cap exhausted) need no action.
+
+Each launch day uses its own state file (<name>_YYYY-MM-DD.json), so yesterday's cycle (still
+running until its next-day exit) and today's new 09:45 cycle run as separate processes in parallel.
 
 Safety default: this script only ever PAPER TRADES (computes and logs every
 intended order, never calls the broker's order-placement call) unless
@@ -84,8 +88,8 @@ assumed)
    limited to --lots, --poll-seconds, --max-reentries, --live per spec.
 
 5. If a leg has not yet broken out by market close (15:30) on the selection
-   day, it is marked "no_entry" and permanently skipped -- it does not
-   carry over to try again on a later day. tracked_low is specific to the
+   day, it carries over and keeps watching the same frozen low the next day
+   until the exit deadline. tracked_low itself is specific to the
    09:45-13:59:59 window of that single trading day.
 
 6. If the script is launched after 09:45 on a trading day (but before market
@@ -156,6 +160,7 @@ from leg_lifecycle import (
     execute_order as _lifecycle_execute_order,
     handle_stop_loss as _lifecycle_handle_stop_loss,
     handle_reentry as _lifecycle_handle_reentry,
+    cancel_stop as _lifecycle_cancel_stop,
     apply_stop_loss_or_reentry,
     print_live_warning_banner,
 )
@@ -376,6 +381,7 @@ def run_selection_scan(client: JainamClient, lots: int, live: bool, max_reentrie
             "delta_at_selection": leg_selection["delta"],
             "tracked_low": track_low(None, initial_ltp),
             "tracked_low_frozen": False,
+            "tracking_date": now.date().isoformat(),
             "entry_price": None,
             "entry_time": None,
             "status": "watching_breakout",
@@ -456,7 +462,7 @@ def monitor_leg(
     - watching_breakout, before the freeze time: update tracked_low.
     - watching_breakout, at/after the freeze time: freeze tracked_low (once),
       then check for a breakout entry. If market close passes with no
-      breakout, mark the leg no_entry.
+      breakout, keep watching the same frozen low on later days until the exit deadline.
     - open / watching_for_reentry: identical stop-loss / re-entry mechanics
       to delta_strangle_strategy.py, just parameterized with
       STOP_LOSS_MULTIPLIER=1.30 here.
@@ -482,7 +488,9 @@ def monitor_leg(
 
     try:
         if leg["status"] == "watching_breakout":
-            if not leg.get("tracked_low_frozen", False) and now.time() < TRACKED_LOW_FREEZE_TIME:
+            today = now.date().isoformat()
+            tracking_date = leg.get("tracking_date", today)
+            if not leg.get("tracked_low_frozen", False) and today == tracking_date and now.time() < TRACKED_LOW_FREEZE_TIME:
                 leg["tracked_low"] = track_low(leg["tracked_low"], ltp)
             else:
                 if not leg.get("tracked_low_frozen", False):
@@ -490,16 +498,12 @@ def monitor_leg(
                     logger.info(
                         "%s tracked_low FROZEN at %.2f (%s).", leg_key, leg["tracked_low"], TRACKED_LOW_FREEZE_TIME
                     )
-                if now.time() >= BREAKOUT_START_TIME:
+                # Carry-over: a leg that never broke out stays in watching_breakout past the close and
+                # keeps watching the same frozen low on later days from the open (a gap-down open
+                # below the low sells at the open) until the cycle's exit deadline.
+                if today > tracking_date or now.time() >= BREAKOUT_START_TIME:
                     if check_breakout(leg, ltp):
                         leg = place_entry(client, leg_key, leg, quantity, live)
-                    elif now.time() >= MARKET_CLOSE_TIME:
-                        leg["status"] = "no_entry"
-                        logger.info(
-                            "%s (%s) never broke its tracked_low (%.2f) before market close -- no entry, "
-                            "skipped for the rest of this cycle.",
-                            leg_key, leg["tradingsymbol"], leg["tracked_low"],
-                        )
         elif leg["status"] in ("open", "watching_for_reentry"):
             leg = apply_stop_loss_or_reentry(
                 client, logger, leg_key, leg, ltp, quantity, live, STOP_LOSS_MULTIPLIER, max_reentries, NFO_EXCHANGE
@@ -571,6 +575,17 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
     untouched. Logs final per-leg P&L and stop/re-entry counts."""
     quantity = state["quantity"]
     for leg_key, leg in state["legs"].items():
+        if leg["status"] == "open" and live:
+            # Cancel the resting broker stop first; if it already filled the leg is flat -- no second BUY.
+            try:
+                _lifecycle_cancel_stop(client, logger, leg_key, leg, quantity)
+            except RuntimeError as exc:
+                logger.critical(
+                    "FINAL EXIT: could not clear the resting stop for %s (%s): %s. Check Jainam manually.",
+                    leg_key, leg["tradingsymbol"], exc,
+                )
+                leg["status"] = "error"
+                leg["error"] = str(exc)
         if leg["status"] == "open":
             try:
                 exit_price = _execute_order(client, leg["tradingsymbol"], "BUY", quantity, live)
@@ -619,6 +634,16 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
 
 
 def run(args: argparse.Namespace) -> None:
+    # One state file per launch day, so a cycle carried into the next day (breakout watch / open
+    # positions until the next-day exit) keeps running in its own process while the new day's
+    # 09:45 cycle starts independently, instead of resuming yesterday's state.
+    global STATE_FILE
+    if args.state_file:
+        STATE_FILE = args.state_file
+    else:
+        root, ext = os.path.splitext(STATE_FILE)
+        STATE_FILE = f"{root}_{datetime.now(IST).date().isoformat()}{ext}"
+
     client = get_jainam_client()
 
     state = load_state()
@@ -628,6 +653,12 @@ def run(args: argparse.Namespace) -> None:
         logger.info(
             "Existing cycle found in %s (selection_time=%s) -- resuming (live=%s, max_reentries=%s).",
             STATE_FILE, state.get("selection_time"), live, max_reentries,
+        )
+        # A resumed process has no instrument map yet; load the saved cycle's expiry grid so its
+        # contracts can be quoted and ordered.
+        _retry_call(
+            fetch_instruments, client, min_expiry=datetime.fromisoformat(state["expiry"]).date(),
+            description="fetch_instruments (resume)",
         )
         if live != args.live:
             logger.warning(
@@ -659,6 +690,14 @@ def run(args: argparse.Namespace) -> None:
 
     logger.info("Squaring off any remaining open legs for final exit.")
     state = exit_all(client, state, live)
+
+    if any(leg["status"] == "error" for leg in state["legs"].values()):
+        # A leg may still be open at the broker: keep the state file instead of discarding the only record.
+        logger.critical(
+            "One or more legs ended in ERROR (a position may still be OPEN). %s is KEPT -- reconcile manually "
+            "on Jainam before starting a new cycle.", STATE_FILE,
+        )
+        return
 
     clear_state()
     logger.info("Cycle complete. %s cleared. Ready for the next cycle.", STATE_FILE)
@@ -693,6 +732,12 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         action="store_true",
         help="Place real orders. Default (omitted): paper mode -- compute and log everything, never "
         "call the broker's order-placement endpoint.",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Resume the saved cycle in this specific state file (used to re-attach to positions left open by "
+        "an earlier outage) instead of this launch's default state file.",
     )
     return parser.parse_args(argv)
 

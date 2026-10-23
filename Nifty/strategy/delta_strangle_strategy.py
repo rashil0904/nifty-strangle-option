@@ -145,6 +145,7 @@ from leg_lifecycle import (
     execute_order as _lifecycle_execute_order,
     handle_stop_loss as _lifecycle_handle_stop_loss,
     handle_reentry as _lifecycle_handle_reentry,
+    cancel_stop as _lifecycle_cancel_stop,
     apply_stop_loss_or_reentry,
     print_live_warning_banner,
 )
@@ -495,6 +496,17 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
     untouched. Logs final per-leg P&L and stop/re-entry counts."""
     quantity = state["quantity"]
     for leg_key, leg in state["legs"].items():
+        if leg["status"] == "open" and live:
+            # Cancel the resting broker stop first; if it already filled the leg is flat -- no second BUY.
+            try:
+                _lifecycle_cancel_stop(client, logger, leg_key, leg, quantity)
+            except RuntimeError as exc:
+                logger.critical(
+                    "FINAL EXIT: could not clear the resting stop for %s (%s): %s. Check Jainam manually.",
+                    leg_key, leg["tradingsymbol"], exc,
+                )
+                leg["status"] = "error"
+                leg["error"] = str(exc)
         if leg["status"] == "open":
             try:
                 exit_price = _execute_order(client, leg["tradingsymbol"], "BUY", quantity, live)
@@ -543,6 +555,10 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
 
 
 def run(args: argparse.Namespace) -> None:
+    global STATE_FILE
+    if args.state_file:
+        STATE_FILE = args.state_file
+
     client = get_jainam_client()
 
     state = load_state()
@@ -552,6 +568,12 @@ def run(args: argparse.Namespace) -> None:
         logger.info(
             "Existing cycle found in %s (entry_time=%s) -- resuming (live=%s, max_reentries=%s).",
             STATE_FILE, state.get("entry_time"), live, max_reentries,
+        )
+        # A resumed process has no instrument map yet; load the saved cycle's expiry grid so its
+        # contracts can be quoted and ordered.
+        _retry_call(
+            fetch_instruments, client, min_expiry=datetime.fromisoformat(state["expiry"]).date(),
+            description="fetch_instruments (resume)",
         )
         if live != args.live:
             logger.warning(
@@ -583,6 +605,14 @@ def run(args: argparse.Namespace) -> None:
 
     logger.info("Squaring off any remaining open legs for final exit.")
     state = exit_all(client, state, live)
+
+    if any(leg["status"] == "error" for leg in state["legs"].values()):
+        # A leg may still be open at the broker: keep the state file instead of discarding the only record.
+        logger.critical(
+            "One or more legs ended in ERROR (a position may still be OPEN). %s is KEPT -- reconcile manually "
+            "on Jainam before starting a new cycle.", STATE_FILE,
+        )
+        return
 
     clear_state()
     logger.info("Cycle complete. %s cleared. Ready for the next cycle.", STATE_FILE)
@@ -617,6 +647,12 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         action="store_true",
         help="Place real orders. Default (omitted): paper mode -- compute and log everything, never "
         "call the broker's order-placement endpoint.",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Resume the saved cycle in this specific state file (used to re-attach to positions left open by "
+        "an earlier outage) instead of this launch's default state file.",
     )
     return parser.parse_args(argv)
 
