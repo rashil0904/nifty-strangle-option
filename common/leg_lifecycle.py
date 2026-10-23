@@ -39,6 +39,7 @@ from typing import Optional
 
 from jainam_client import JainamClient
 from broker_errors import BrokerAuthError, BrokerError
+import telegram_notify
 
 try:
     from zoneinfo import ZoneInfo
@@ -376,7 +377,9 @@ def arm_stop(
     return leg
 
 
-def record_stop_loss(logger: logging.Logger, leg_key: str, leg: dict, quantity: int, exit_price: float) -> dict:
+def record_stop_loss(
+    logger: logging.Logger, leg_key: str, leg: dict, quantity: int, exit_price: float, live: bool = True
+) -> dict:
     """Book a stop-out at exit_price: P&L, counters, and flip the leg to watching_for_reentry."""
     pnl = (leg["entry_price"] - exit_price) * quantity
     leg["realized_pnl"] = leg.get("realized_pnl", 0.0) + pnl
@@ -396,6 +399,13 @@ def record_stop_loss(logger: logging.Logger, leg_key: str, leg: dict, quantity: 
         "STOP-LOSS: %s %s bought back @ %.2f (entry was %.2f, segment P&L %+.2f). "
         "Now watching for re-entry <= %.2f.",
         leg_key, leg["tradingsymbol"], exit_price, leg["entry_price"], pnl, leg["entry_price"],
+    )
+    telegram_notify.send(
+        f"[{'LIVE' if live else 'PAPER'}] [{logger.name}] STOP-LOSS\n"
+        f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+        f"Bought back @ {exit_price:.2f} (entry was {leg['entry_price']:.2f})\n"
+        f"Now watching for re-entry <= {leg['entry_price']:.2f}",
+        logger,
     )
     return leg
 
@@ -418,7 +428,7 @@ def check_broker_stop(client: JainamClient, logger: logging.Logger, leg_key: str
     status = latest.get("status")
     if status == "COMPLETE":
         leg["sl_order_id"] = None
-        record_stop_loss(logger, leg_key, leg, quantity, float(latest["average_price"]))
+        record_stop_loss(logger, leg_key, leg, quantity, float(latest["average_price"]), live=True)
         return True
     if status in ("REJECTED", "CANCELLED"):
         leg["sl_order_id"] = None
@@ -468,7 +478,7 @@ def handle_stop_loss(
     if live and cancel_stop(client, logger, leg_key, leg, quantity):
         return leg
     exit_price = execute_order(client, logger, leg["tradingsymbol"], "BUY", quantity, live, exchange)
-    return record_stop_loss(logger, leg_key, leg, quantity, exit_price)
+    return record_stop_loss(logger, leg_key, leg, quantity, exit_price, live=live)
 
 
 def handle_reentry(
@@ -491,6 +501,12 @@ def handle_reentry(
     )
     logger.info(
         "RE-ENTRY #%d: %s %s sold @ %.2f.", leg["reentry_count"], leg_key, leg["tradingsymbol"], new_entry_price
+    )
+    telegram_notify.send(
+        f"[{'LIVE' if live else 'PAPER'}] [{logger.name}] RE-ENTRY #{leg['reentry_count']}\n"
+        f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+        f"Sold @ {new_entry_price:.2f}",
+        logger,
     )
     return leg
 

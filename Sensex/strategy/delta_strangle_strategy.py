@@ -115,6 +115,7 @@ sys.path.insert(0, os.path.join(_THIS_DIR, "..", "helpers"))
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "..", "common"))
 
 from jainam_client import JainamClient
+import telegram_notify
 from sensex_delta_model import (
     IST,
     BFO_EXCHANGE,
@@ -342,6 +343,13 @@ def place_entry(client: JainamClient, leg_key: str, leg_selection: dict, quantit
         "ENTRY: %s %s (strike %.1f, delta %+.3f) SOLD @ %.2f x%d",
         leg_key, leg_selection["tradingsymbol"], leg_selection["strike"], leg_selection["delta"], entry_price, quantity,
     )
+    telegram_notify.send(
+        f"[{'LIVE' if live else 'PAPER'}] [SENSEX STRANGLE] ENTRY\n"
+        f"{leg_key.upper()}: {leg_selection['tradingsymbol']}\n"
+        f"Strike {leg_selection['strike']:.0f}, delta {leg_selection['delta']:+.3f}\n"
+        f"Sold @ {entry_price:.2f} x{quantity}",
+        logger,
+    )
     return leg_state
 
 
@@ -384,6 +392,11 @@ def run_entry_scan(client: JainamClient, lots: int, live: bool, max_reentries: O
                 "is INCOMPLETE. State saved to %s -- manual reconciliation required (consider closing "
                 "the entered leg manually) before starting a new cycle.",
                 len(state["legs"]), list(state["legs"].keys()), STATE_FILE,
+            )
+            telegram_notify.send(
+                f"[{'LIVE' if live else 'PAPER'}] [SENSEX STRANGLE] PARTIAL ENTRY FAILURE\n"
+                f"Only entered: {list(state['legs'].keys())}. Manual reconciliation required.",
+                logger,
             )
         raise
 
@@ -443,6 +456,12 @@ def monitor_leg(
             "AUTOMATION HALTED for %s leg (%s) after an order failure: %s. This leg will no longer be "
             "monitored automatically -- check your Jainam positions manually.",
             leg_key, leg["tradingsymbol"], exc,
+        )
+        telegram_notify.send(
+            f"[{'LIVE' if live else 'PAPER'}] [SENSEX STRANGLE] AUTOMATION HALTED\n"
+            f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+            f"Order failure: {exc}\nCheck Jainam positions manually.",
+            logger,
         )
         leg["status"] = "error"
         leg["error"] = str(exc)
@@ -526,11 +545,23 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
                     "FINAL EXIT: %s %s bought back @ %.2f (segment P&L %+.2f).",
                     leg_key, leg["tradingsymbol"], exit_price, pnl,
                 )
+                telegram_notify.send(
+                    f"[{'LIVE' if live else 'PAPER'}] [SENSEX STRANGLE] FINAL EXIT\n"
+                    f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+                    f"Bought back @ {exit_price:.2f}",
+                    logger,
+                )
             except RuntimeError as exc:
                 logger.critical(
                     "FINAL EXIT FAILED for %s leg (%s): %s. This leg may still be OPEN on your Jainam "
                     "account -- check and close it manually.",
                     leg_key, leg["tradingsymbol"], exc,
+                )
+                telegram_notify.send(
+                    f"[{'LIVE' if live else 'PAPER'}] [SENSEX STRANGLE] FINAL EXIT FAILED\n"
+                    f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+                    f"{exc}\nMay still be OPEN -- check Jainam manually.",
+                    logger,
                 )
                 leg["status"] = "error"
                 leg["error"] = str(exc)

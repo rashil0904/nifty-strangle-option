@@ -130,6 +130,7 @@ sys.path.insert(0, os.path.join(_THIS_DIR, "..", "helpers"))
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "..", "common"))
 
 from jainam_client import JainamClient
+import telegram_notify
 from nifty_delta_model import (
     IST,
     NFO_EXCHANGE,
@@ -402,6 +403,13 @@ def run_selection_scan(client: JainamClient, lots: int, live: bool, max_reentrie
             "LOCKED: %s %s (strike %.1f, delta %+.3f), initial tracked_low=%.2f",
             leg_key, leg_selection["tradingsymbol"], leg_selection["strike"], leg_selection["delta"], initial_ltp,
         )
+        telegram_notify.send(
+            f"[{'LIVE' if live else 'PAPER'}] [NIFTY BREAKDOWN] CONTRACT LOCKED\n"
+            f"{leg_key.upper()}: {leg_selection['tradingsymbol']}\n"
+            f"Strike {leg_selection['strike']:.0f}, delta {leg_selection['delta']:+.3f}\n"
+            f"Initial tracked_low = {initial_ltp:.2f}",
+            logger,
+        )
 
     save_state(state)
     logger.info(
@@ -445,6 +453,12 @@ def place_entry(client: JainamClient, leg_key: str, leg: dict, quantity: int, li
     logger.info(
         "BREAKOUT ENTRY: %s %s SOLD @ %.2f x%d (broke below frozen tracked_low %.2f)",
         leg_key, leg["tradingsymbol"], entry_price, quantity, leg["tracked_low"],
+    )
+    telegram_notify.send(
+        f"[{'LIVE' if live else 'PAPER'}] [NIFTY BREAKDOWN] BREAKOUT ENTRY\n"
+        f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+        f"Sold @ {entry_price:.2f} x{quantity} (broke below frozen tracked_low {leg['tracked_low']:.2f})",
+        logger,
     )
     return leg
 
@@ -498,6 +512,12 @@ def monitor_leg(
                     logger.info(
                         "%s tracked_low FROZEN at %.2f (%s).", leg_key, leg["tracked_low"], TRACKED_LOW_FREEZE_TIME
                     )
+                    telegram_notify.send(
+                        f"[{'LIVE' if live else 'PAPER'}] [NIFTY BREAKDOWN] TRACKED_LOW FROZEN\n"
+                        f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+                        f"Frozen at {leg['tracked_low']:.2f} ({TRACKED_LOW_FREEZE_TIME})",
+                        logger,
+                    )
                 # Carry-over: a leg that never broke out stays in watching_breakout past the close and
                 # keeps watching the same frozen low on later days from the open (a gap-down open
                 # below the low sells at the open) until the cycle's exit deadline.
@@ -513,6 +533,12 @@ def monitor_leg(
             "AUTOMATION HALTED for %s leg (%s) after an order failure: %s. This leg will no longer be "
             "monitored automatically -- check your Jainam positions manually.",
             leg_key, leg["tradingsymbol"], exc,
+        )
+        telegram_notify.send(
+            f"[{'LIVE' if live else 'PAPER'}] [NIFTY BREAKDOWN] AUTOMATION HALTED\n"
+            f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+            f"Order failure: {exc}\nCheck Jainam positions manually.",
+            logger,
         )
         leg["status"] = "error"
         leg["error"] = str(exc)
@@ -605,11 +631,23 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
                     "FINAL EXIT: %s %s bought back @ %.2f (segment P&L %+.2f).",
                     leg_key, leg["tradingsymbol"], exit_price, pnl,
                 )
+                telegram_notify.send(
+                    f"[{'LIVE' if live else 'PAPER'}] [NIFTY BREAKDOWN] FINAL EXIT\n"
+                    f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+                    f"Bought back @ {exit_price:.2f}",
+                    logger,
+                )
             except RuntimeError as exc:
                 logger.critical(
                     "FINAL EXIT FAILED for %s leg (%s): %s. This leg may still be OPEN on your Jainam "
                     "account -- check and close it manually.",
                     leg_key, leg["tradingsymbol"], exc,
+                )
+                telegram_notify.send(
+                    f"[{'LIVE' if live else 'PAPER'}] [NIFTY BREAKDOWN] FINAL EXIT FAILED\n"
+                    f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+                    f"{exc}\nMay still be OPEN -- check Jainam manually.",
+                    logger,
                 )
                 leg["status"] = "error"
                 leg["error"] = str(exc)
