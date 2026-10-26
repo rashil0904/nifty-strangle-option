@@ -18,3 +18,5 @@ strategy_log.txt
 # Archived paper-trading runs
 paper_archive/
 cron_*.log
+supervisor_*.txt
+supervisor_memory.json

@@ -494,7 +494,7 @@ def run_monitoring_loop(
             sleep_until(sleep_target)
             continue
 
-        for leg_key in ("call", "put"):
+        for leg_key in list(state["legs"]):
             leg = state["legs"][leg_key]
             if leg["status"] in ("open", "watching_for_reentry"):
                 state["legs"][leg_key] = monitor_leg(client, leg_key, leg, quantity, max_reentries, live)
