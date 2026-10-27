@@ -46,13 +46,13 @@ RESTART_WINDOW = timedelta(minutes=30)
 # name, script (repo-relative), state-file pattern ("{d}" = ISO date for dated files), fresh launch time, minutes of tolerated lateness
 JOBS = [
     {"name": "nifty_strangle", "script": "Nifty/strategy/delta_strangle_strategy.py", "glob": "strategy_state.json",
-     "fresh_state": "strategy_state.json", "at": dtime(10, 58), "late_min": 10},
+     "fresh_state": "strategy_state.json", "at": dtime(10, 58), "late_min": 10, "extra": ["--same-day-expiry", "--resting-entries"]},
     {"name": "sensex_strangle", "script": "Sensex/strategy/delta_strangle_strategy.py", "glob": "sensex_strategy_state.json",
-     "fresh_state": "sensex_strategy_state.json", "at": dtime(10, 58), "late_min": 10},
+     "fresh_state": "sensex_strategy_state.json", "at": dtime(10, 58), "late_min": 10, "extra": ["--resting-entries"]},
     {"name": "nifty_breakdown", "script": "Nifty/strategy/delta_breakdown_strategy.py", "glob": "breakdown_strategy_state_*.json",
-     "fresh_state": "breakdown_strategy_state_{d}.json", "at": dtime(10, 43), "late_min": 15},
+     "fresh_state": "breakdown_strategy_state_{d}.json", "at": dtime(10, 43), "late_min": 15, "extra": ["--same-day-expiry", "--resting-entries"]},
     {"name": "sensex_breakdown", "script": "Sensex/strategy/delta_breakdown_strategy.py", "glob": "sensex_breakdown_strategy_state_*.json",
-     "fresh_state": "sensex_breakdown_strategy_state_{d}.json", "at": dtime(10, 43), "late_min": 15},
+     "fresh_state": "sensex_breakdown_strategy_state_{d}.json", "at": dtime(10, 43), "late_min": 15, "extra": ["--resting-entries"]},
 ]
 
 LOG_FILE = os.path.join(REPO, "supervisor_log.txt")
@@ -127,7 +127,7 @@ def save_memory(mem: dict) -> None:
 
 
 def launch(job: dict, state_file: str, live: bool, dry: bool, why: str) -> bool:
-    cmd = [sys.executable.replace("pythonw.exe", "python.exe"), job["script"]] + (["--live"] if live else []) + ["--state-file", state_file]
+    cmd = [sys.executable.replace("pythonw.exe", "python.exe"), job["script"]] + (["--live"] if live else []) + ["--state-file", state_file] + job.get("extra", [])
     log(f"{'WOULD LAUNCH' if dry else 'LAUNCH'} {job['name']} ({why}): --state-file {state_file}")
     if dry:
         return True
@@ -143,6 +143,21 @@ def launch(job: dict, state_file: str, live: bool, dry: bool, why: str) -> bool:
                 log(f"launch of {job['name']} FAILED: {exc}", alert=True)
                 return False
     return False
+
+
+def clear_stale_orders(leg: dict, today: str) -> None:
+    """DAY orders (resting stop / entry) from an EARLIER session no longer exist at the broker: forget their ids so
+    they are re-placed. An order placed today may still be live (the process died mid-day) -- keep its id, or the
+    resumed process would park a duplicate."""
+    for id_key, placed_key, extra in (("sl_order_id", "sl_placed_at", ("sl_price",)),
+                                      ("entry_order_id", "entry_placed_at", ("entry_trigger", "entry_limit"))):
+        if leg.get(id_key) and not str(leg.get(placed_key, "")).startswith(today):
+            leg[id_key] = None
+            for k in extra:
+                leg.pop(k, None)
+            leg.pop(placed_key, None)
+    leg["sl_arm_failures"] = 0
+    leg["entry_arm_failures"] = 0
 
 
 def tick(now: datetime, dry: bool, ignore_procs: bool) -> None:
@@ -176,6 +191,12 @@ def tick(now: datetime, dry: bool, ignore_procs: bool) -> None:
                     mem["gave_up"][key] = True
                 continue
             statuses = {k: l["status"] for k, l in state["legs"].items()}
+            if not dry:                                    # DAY stop orders from an earlier session no longer exist
+                for leg in state["legs"].values():
+                    clear_stale_orders(leg, now.date().isoformat())
+                tmp = path + ".tmp"
+                json.dump(state, open(tmp, "w"), indent=2)
+                os.replace(tmp, path)
             first_start = not hist and key not in restarts
             ok = launch(job, name, state.get("live", LIVE), dry, f"cycle found with no process, legs={statuses}")
             if ok and not dry:
