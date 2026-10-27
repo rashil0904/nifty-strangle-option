@@ -370,6 +370,7 @@ def arm_stop(
         return leg
     leg["sl_order_id"] = str(order_id)
     leg["sl_price"] = trigger
+    leg["sl_placed_at"] = datetime.now(IST).isoformat()
     logger.info(
         "STOP ORDER PLACED: %s %s BUY stop-limit trigger %.2f / limit %.2f (entry %.2f x %.2f) -- order_id=%s",
         leg_key, leg["tradingsymbol"], trigger, limit, leg["entry_price"], multiplier, order_id,
@@ -410,6 +411,24 @@ def record_stop_loss(
     return leg
 
 
+def _order_unknown(exc: Exception) -> bool:
+    """True if the broker says it has no such order (e.g. a previous day's DAY stop, purged after the close)."""
+    text = str(exc)
+    return "e-orders-0001" in text or "not found" in text.lower()
+
+
+def _stop_is_old(leg: dict, min_age_seconds: int = 120, key: str = "sl_placed_at") -> bool:
+    """A 'not found' answer only means 'expired' if the order was placed a while ago (a just-placed order can
+    be briefly unknown to the order-history API)."""
+    placed = leg.get(key)
+    if not placed:
+        return True
+    try:
+        return (datetime.now(IST) - datetime.fromisoformat(placed)).total_seconds() > min_age_seconds
+    except ValueError:
+        return True
+
+
 def check_broker_stop(client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict, quantity: int) -> bool:
     """Look at the resting stop. True iff it has FILLED (the leg is then booked as stopped out).
     A cancelled/expired stop is simply forgotten so it can be re-placed; a rejected one counts
@@ -420,6 +439,12 @@ def check_broker_stop(client: JainamClient, logger: logging.Logger, leg_key: str
     try:
         history = client.order_history(order_id)
     except BrokerError as exc:
+        if _order_unknown(exc) and _stop_is_old(leg):
+            logger.warning(
+                "Resting stop %s for %s is unknown to the broker (expired) -- forgetting it so it is re-placed.", order_id, leg_key
+            )
+            leg["sl_order_id"] = None
+            return False
         logger.warning("order_history(%s) for %s stop failed: %s", order_id, leg_key, exc)
         return False
     if not history:
@@ -458,12 +483,160 @@ def cancel_stop(client: JainamClient, logger: logging.Logger, leg_key: str, leg:
     except BrokerError as exc:
         if check_broker_stop(client, logger, leg_key, leg, quantity):
             return True
+        if _order_unknown(exc) and _stop_is_old(leg):
+            leg["sl_order_id"] = None
+            logger.warning("Resting stop %s for %s no longer exists at the broker -- treating as already gone.", order_id, leg_key)
+            return False
         raise RuntimeError(f"Could not cancel resting stop {order_id} for {leg_key}: {exc}") from exc
     if check_broker_stop(client, logger, leg_key, leg, quantity):
         return True
     leg["sl_order_id"] = None
     logger.info("Resting stop %s for %s cancelled.", order_id, leg_key)
     return False
+
+
+# --------------------------------------------------------------------------
+# Broker-side (resting) ENTRY orders -- live mode, only when RESTING_ENTRY_ORDERS is switched on
+# (--resting-entries). A re-entry ("sell when price falls back to the old entry") and a breakout entry
+# ("sell when price falls below the frozen low") are both "sell once price falls to X", so a SELL stop-limit
+# is parked at X instead of reacting to a 15-second poll with a market order. The software path stays as the
+# fallback: no resting order (placement failed / price already through X) -> market order as before, and a
+# resting order the market has run away from (LTP below its limit) is cancelled and replaced by a market SELL.
+# --------------------------------------------------------------------------
+
+RESTING_ENTRY_ORDERS = False
+ENTRY_LIMIT_BUFFER = 0.97  # SELL stop-limit: limit = trigger * this
+MAX_ENTRY_ARM_FAILURES = 3
+
+
+def entry_trigger_price(level: float) -> float:
+    """Nearest tick to `level` (the price at/below which the SELL should trigger)."""
+    return round(round(level / STOP_TICK) * STOP_TICK, 2)
+
+
+def arm_entry(
+    client: JainamClient,
+    logger: logging.Logger,
+    leg_key: str,
+    leg: dict,
+    ltp: float,
+    quantity: int,
+    live: bool,
+    trigger: float,
+    exchange: str,
+) -> dict:
+    """Park a SELL stop-limit that triggers when price falls to `trigger`. No-op in paper mode, with the feature
+    off, when one is already resting, after repeated failures, or when the market is already at/through the
+    trigger (the caller then enters at market)."""
+    if (not live or not RESTING_ENTRY_ORDERS or leg.get("entry_order_id")
+            or leg.get("entry_arm_failures", 0) >= MAX_ENTRY_ARM_FAILURES):
+        return leg
+    trigger = entry_trigger_price(trigger)
+    if trigger <= STOP_TICK or ltp <= trigger:
+        return leg
+    limit = round(math.floor(trigger * ENTRY_LIMIT_BUFFER / STOP_TICK + 1e-9) * STOP_TICK, 2)
+    try:
+        order_id = client.place_order(
+            variety=client.VARIETY_REGULAR,
+            exchange=exchange,
+            tradingsymbol=leg["tradingsymbol"],
+            transaction_type="SELL",
+            quantity=quantity,
+            product=client.PRODUCT_NRML,
+            order_type=client.ORDER_TYPE_STOP_LIMIT,
+            stop_price=trigger,
+            limit_price=limit,
+        )
+    except BrokerError as exc:
+        leg["entry_arm_failures"] = leg.get("entry_arm_failures", 0) + 1
+        logger.warning(
+            "Could not place resting entry for %s %s @ %.2f (failure %d/%d): %s -- software entry remains active.",
+            leg_key, leg["tradingsymbol"], trigger, leg["entry_arm_failures"], MAX_ENTRY_ARM_FAILURES, exc,
+        )
+        return leg
+    leg["entry_order_id"] = str(order_id)
+    leg["entry_trigger"] = trigger
+    leg["entry_limit"] = limit
+    leg["entry_placed_at"] = datetime.now(IST).isoformat()
+    logger.info(
+        "ENTRY ORDER PLACED: %s %s SELL stop-limit trigger %.2f / limit %.2f -- order_id=%s",
+        leg_key, leg["tradingsymbol"], trigger, limit, order_id,
+    )
+    return leg
+
+
+def _forget_entry_order(leg: dict) -> None:
+    for k in ("entry_order_id", "entry_trigger", "entry_limit", "entry_placed_at"):
+        leg.pop(k, None)
+
+
+def check_entry_order(client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict) -> Optional[float]:
+    """Look at the resting entry order. Returns its fill price if it FILLED (the order is then forgotten and the
+    caller books the entry); None otherwise. A cancelled/expired order is forgotten so it is re-placed; a
+    rejected one counts as an arming failure (software entry covers it)."""
+    order_id = leg.get("entry_order_id")
+    if not order_id:
+        return None
+    try:
+        history = client.order_history(order_id)
+    except BrokerError as exc:
+        if _order_unknown(exc) and _stop_is_old(leg, key="entry_placed_at"):
+            logger.warning("Resting entry %s for %s is unknown to the broker (expired) -- forgetting it.", order_id, leg_key)
+            _forget_entry_order(leg)
+            return None
+        logger.warning("order_history(%s) for %s entry failed: %s", order_id, leg_key, exc)
+        return None
+    if not history:
+        return None
+    latest = history[-1]
+    status = latest.get("status")
+    if status == "COMPLETE":
+        _forget_entry_order(leg)
+        return float(latest["average_price"])
+    if status in ("REJECTED", "CANCELLED"):
+        _forget_entry_order(leg)
+        if status == "REJECTED":
+            leg["entry_arm_failures"] = leg.get("entry_arm_failures", 0) + 1
+        logger.warning(
+            "Resting entry %s for %s ended %s (%s) -- %s.", order_id, leg_key, status, latest.get("status_message"),
+            "will be re-placed" if status == "CANCELLED" else "software entry covers it",
+        )
+    return None
+
+
+def cancel_entry_order(client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict) -> Optional[float]:
+    """Cancel the resting entry order before this process enters (or exits) itself. Returns the fill price if
+    the order had already FILLED (the caller must book that entry and NOT send another SELL); None once it is
+    gone. Raises RuntimeError if it can neither be confirmed filled nor cancelled."""
+    order_id = leg.get("entry_order_id")
+    if not order_id:
+        return None
+    fill = check_entry_order(client, logger, leg_key, leg)
+    if fill is not None or not leg.get("entry_order_id"):
+        return fill
+    try:
+        client.cancel_order(order_id)
+    except BrokerError as exc:
+        fill = check_entry_order(client, logger, leg_key, leg)
+        if fill is not None:
+            return fill
+        if _order_unknown(exc) and _stop_is_old(leg, key="entry_placed_at"):
+            _forget_entry_order(leg)
+            logger.warning("Resting entry %s for %s no longer exists at the broker -- treating as gone.", order_id, leg_key)
+            return None
+        raise RuntimeError(f"Could not cancel resting entry {order_id} for {leg_key}: {exc}") from exc
+    fill = check_entry_order(client, logger, leg_key, leg)   # a fill that raced the cancel
+    if fill is not None:
+        return fill
+    _forget_entry_order(leg)
+    logger.info("Resting entry %s for %s cancelled.", order_id, leg_key)
+    return None
+
+
+def entry_order_stuck(leg: dict, ltp: float) -> bool:
+    """True if a resting SELL stop-limit exists but the market has run below its limit price (it cannot fill
+    unless price recovers) -- the caller should cancel it and enter at market instead."""
+    return bool(leg.get("entry_order_id")) and ltp < leg.get("entry_limit", 0.0)
 
 
 def handle_stop_loss(
@@ -486,10 +659,16 @@ def handle_reentry(
 ) -> dict:
     """Re-sell a flat, watching leg at market; the new fill becomes its new entry_price."""
     new_entry_price = execute_order(client, logger, leg["tradingsymbol"], "SELL", quantity, live, exchange)
+    return book_reentry(logger, leg_key, leg, quantity, new_entry_price, live)
+
+
+def book_reentry(logger: logging.Logger, leg_key: str, leg: dict, quantity: int, new_entry_price: float, live: bool) -> dict:
+    """Record a re-entry SELL filled at new_entry_price (market order or resting entry order)."""
     leg["entry_price"] = new_entry_price
     leg["reentry_count"] = leg.get("reentry_count", 0) + 1
     leg["status"] = "open"
     leg["sl_arm_failures"] = 0
+    leg["entry_arm_failures"] = 0
     leg.setdefault("history", []).append(
         {
             "type": "reentry",
@@ -546,16 +725,28 @@ def apply_stop_loss_or_reentry(
             resting and ltp >= trigger * SOFTWARE_FALLBACK_BUFFER
         ):
             leg = handle_stop_loss(client, logger, leg_key, leg, quantity, live, exchange)
-    elif leg["status"] == "watching_for_reentry" and ltp <= leg["entry_price"]:
+    elif leg["status"] == "watching_for_reentry":
         reentry_count = leg.get("reentry_count", 0)
-        if max_reentries is not None and reentry_count >= max_reentries:
-            logger.info(
-                "%s leg reached max_reentries=%d (reentry_count=%d) -- staying flat for the rest of this cycle.",
-                leg_key, max_reentries, reentry_count,
-            )
-            leg["status"] = "capped_flat"
-        else:
-            leg = handle_reentry(client, logger, leg_key, leg, quantity, live, exchange)
+        at_cap = max_reentries is not None and reentry_count >= max_reentries
+        if live and RESTING_ENTRY_ORDERS and not at_cap:
+            fill = check_entry_order(client, logger, leg_key, leg)
+            if fill is not None:
+                return book_reentry(logger, leg_key, leg, quantity, fill, live)
+            leg = arm_entry(client, logger, leg_key, leg, ltp, quantity, live, leg["entry_price"], exchange)
+        resting = bool(leg.get("entry_order_id"))
+        if ltp <= leg["entry_price"] and (not resting or entry_order_stuck(leg, ltp)):
+            if at_cap:
+                logger.info(
+                    "%s leg reached max_reentries=%d (reentry_count=%d) -- staying flat for the rest of this cycle.",
+                    leg_key, max_reentries, reentry_count,
+                )
+                leg["status"] = "capped_flat"
+            else:
+                if resting:
+                    fill = cancel_entry_order(client, logger, leg_key, leg)
+                    if fill is not None:
+                        return book_reentry(logger, leg_key, leg, quantity, fill, live)
+                leg = handle_reentry(client, logger, leg_key, leg, quantity, live, exchange)
     return leg
 
 

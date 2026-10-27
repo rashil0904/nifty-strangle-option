@@ -146,6 +146,7 @@ from nifty_delta_model import (
     black76_delta,
     implied_vol,
 )
+import leg_lifecycle as _leg_lifecycle
 from leg_lifecycle import (
     MARKET_CLOSE_TIME,
     save_state as _lifecycle_save_state,
@@ -162,6 +163,12 @@ from leg_lifecycle import (
     handle_stop_loss as _lifecycle_handle_stop_loss,
     handle_reentry as _lifecycle_handle_reentry,
     cancel_stop as _lifecycle_cancel_stop,
+    cancel_entry_order as _lifecycle_cancel_entry_order,
+    check_entry_order as _lifecycle_check_entry_order,
+    arm_entry as _lifecycle_arm_entry,
+    entry_order_stuck as _lifecycle_entry_order_stuck,
+    book_reentry as _lifecycle_book_reentry,
+    STOP_TICK as _STOP_TICK,
     apply_stop_loss_or_reentry,
     print_live_warning_banner,
 )
@@ -177,6 +184,8 @@ SELECTION_TIME = dtime(10, 45)
 TRACKED_LOW_FREEZE_TIME = dtime(11, 29, 59)
 BREAKOUT_START_TIME = dtime(11, 30)
 EXIT_TIME = dtime(11, 15)  # on the next trading day after selection
+EXPIRY_DAY_EXIT_TIME = dtime(15, 15)  # when the contract expires today: square off before it settles
+SAME_DAY_EXPIRY = False  # set by --same-day-expiry
 
 TARGET_DELTA_CALL = 0.30
 TARGET_DELTA_PUT = -0.30
@@ -351,8 +360,9 @@ def run_selection_scan(client: JainamClient, lots: int, live: bool, max_reentrie
     # 11:30 today could still be open and held overnight to tomorrow's
     # 11:15 exit, so a contract expiring at today's 15:30 cutoff would
     # already be settled mid-hold. Require strictly next week's expiry.
-    tomorrow = (datetime.now(IST) + timedelta(days=1)).date()
-    instruments = _retry_call(fetch_instruments, client, min_expiry=tomorrow, description="fetch_instruments")
+    # --same-day-expiry lifts that floor: trade today's expiry and square off before it settles.
+    floor = datetime.now(IST).date() if SAME_DAY_EXPIRY else (datetime.now(IST) + timedelta(days=1)).date()
+    instruments = _retry_call(fetch_instruments, client, min_expiry=floor, description="fetch_instruments")
     selection = select_entry_strikes(client, instruments)
 
     call_lot, put_lot = selection["call"]["lot_size"], selection["put"]["lot_size"]
@@ -366,7 +376,8 @@ def run_selection_scan(client: JainamClient, lots: int, live: bool, max_reentrie
         "expiry": selection["expiry"].isoformat(),
         "quantity": quantity,
         "lots": lots,
-        "exit_deadline": exit_deadline_from_selection(now).isoformat(),
+        "exit_deadline": (datetime.combine(now.date(), EXPIRY_DAY_EXIT_TIME, tzinfo=IST)
+                          if selection["expiry"] == now.date() else exit_deadline_from_selection(now)).isoformat(),
         "live": live,
         "max_reentries": max_reentries,
         "legs": {},
@@ -434,9 +445,13 @@ def check_breakout(leg: dict, ltp: float) -> bool:
     )
 
 
-def place_entry(client: JainamClient, leg_key: str, leg: dict, quantity: int, live: bool) -> dict:
+def place_entry(
+    client: JainamClient, leg_key: str, leg: dict, quantity: int, live: bool, fill_price: Optional[float] = None
+) -> dict:
     """Breakout SELL entry for a leg that just broke below its frozen tracked_low."""
-    entry_price = _execute_order(client, leg["tradingsymbol"], "SELL", quantity, live)
+    entry_price = fill_price if fill_price is not None else _execute_order(
+        client, leg["tradingsymbol"], "SELL", quantity, live
+    )
     now = datetime.now(IST).isoformat()
     leg["entry_price"] = entry_price
     leg["entry_time"] = now
@@ -522,7 +537,20 @@ def monitor_leg(
                 # keeps watching the same frozen low on later days from the open (a gap-down open
                 # below the low sells at the open) until the cycle's exit deadline.
                 if today > tracking_date or now.time() >= BREAKOUT_START_TIME:
-                    if check_breakout(leg, ltp):
+                    if live and _leg_lifecycle.RESTING_ENTRY_ORDERS:
+                        # Resting SELL stop-limit one tick under the frozen low (== 'ltp < tracked_low').
+                        fill = _lifecycle_check_entry_order(client, logger, leg_key, leg)
+                        if fill is not None:
+                            return place_entry(client, leg_key, leg, quantity, live, fill_price=fill)
+                        leg = _lifecycle_arm_entry(
+                            client, logger, leg_key, leg, ltp, quantity, live, leg["tracked_low"] - _STOP_TICK, NFO_EXCHANGE
+                        )
+                    resting = bool(leg.get("entry_order_id"))
+                    if check_breakout(leg, ltp) and (not resting or _lifecycle_entry_order_stuck(leg, ltp)):
+                        if resting:
+                            fill = _lifecycle_cancel_entry_order(client, logger, leg_key, leg)
+                            if fill is not None:
+                                return place_entry(client, leg_key, leg, quantity, live, fill_price=fill)
                         leg = place_entry(client, leg_key, leg, quantity, live)
         elif leg["status"] in ("open", "watching_for_reentry"):
             leg = apply_stop_loss_or_reentry(
@@ -580,7 +608,7 @@ def run_monitoring_loop(
             sleep_until(sleep_target)
             continue
 
-        for leg_key in ("call", "put"):
+        for leg_key in list(state["legs"]):
             leg = state["legs"][leg_key]
             if leg["status"] in active_statuses:
                 state["legs"][leg_key] = monitor_leg(client, leg_key, leg, quantity, max_reentries, live, now)
@@ -601,6 +629,22 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
     untouched. Logs final per-leg P&L and stop/re-entry counts."""
     quantity = state["quantity"]
     for leg_key, leg in state["legs"].items():
+        if live and leg.get("entry_order_id"):
+            # A resting entry order must not outlive the cycle; if it filled, the leg is now open and is closed below.
+            try:
+                fill = _lifecycle_cancel_entry_order(client, logger, leg_key, leg)
+                if fill is not None:
+                    if leg["status"] == "watching_breakout":
+                        place_entry(client, leg_key, leg, quantity, live, fill_price=fill)
+                    else:
+                        _lifecycle_book_reentry(logger, leg_key, leg, quantity, fill, live)
+            except RuntimeError as exc:
+                logger.critical(
+                    "FINAL EXIT: could not clear the resting entry order for %s (%s): %s. Check Jainam manually.",
+                    leg_key, leg["tradingsymbol"], exc,
+                )
+                leg["status"] = "error"
+                leg["error"] = str(exc)
         if leg["status"] == "open" and live:
             # Cancel the resting broker stop first; if it already filled the leg is flat -- no second BUY.
             try:
@@ -675,13 +719,15 @@ def run(args: argparse.Namespace) -> None:
     # One state file per launch day, so a cycle carried into the next day (breakout watch / open
     # positions until the next-day exit) keeps running in its own process while the new day's
     # 10:45 cycle starts independently, instead of resuming yesterday's state.
-    global STATE_FILE
+    global STATE_FILE, SAME_DAY_EXPIRY
+    SAME_DAY_EXPIRY = args.same_day_expiry
     if args.state_file:
         STATE_FILE = args.state_file
     else:
         root, ext = os.path.splitext(STATE_FILE)
         STATE_FILE = f"{root}_{datetime.now(IST).date().isoformat()}{ext}"
 
+    _leg_lifecycle.RESTING_ENTRY_ORDERS = args.resting_entries
     client = get_jainam_client()
 
     state = load_state()
@@ -776,6 +822,18 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         default=None,
         help="Resume the saved cycle in this specific state file (used to re-attach to positions left open by "
         "an earlier outage) instead of this launch's default state file.",
+    )
+    parser.add_argument(
+        "--same-day-expiry",
+        action="store_true",
+        help="When the nearest weekly expiry is today, trade it (instead of skipping to next week) and square off "
+        "at 15:15 today rather than carrying overnight.",
+    )
+    parser.add_argument(
+        "--resting-entries",
+        action="store_true",
+        help="Live only: park re-entries and breakout entries as broker-side SELL stop-limit orders instead of reacting to the poll "
+        "with a market order (the market-order path stays as the fallback).",
     )
     return parser.parse_args(argv)
 
