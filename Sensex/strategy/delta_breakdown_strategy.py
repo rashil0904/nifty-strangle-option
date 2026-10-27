@@ -131,7 +131,6 @@ sys.path.insert(0, os.path.join(_THIS_DIR, "..", "..", "common"))
 
 from jainam_client import JainamClient
 import telegram_notify
-from market_feed import MarketFeed
 from sensex_delta_model import (
     IST,
     BFO_EXCHANGE,
@@ -170,8 +169,6 @@ from leg_lifecycle import (
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
-
-_feed: Optional[MarketFeed] = None
 
 STATE_FILE = "sensex_breakdown_strategy_state.json"
 LOG_FILE = "sensex_breakdown_strategy_log.txt"
@@ -263,7 +260,7 @@ def _retry_call(func, *args, description: str = "call", **kwargs):
 
 
 def fetch_ltp(client: JainamClient, tradingsymbol: str) -> float:
-    return _feed.get_ltp(BFO_EXCHANGE, tradingsymbol, client, logger)
+    return _lifecycle_fetch_ltp(client, tradingsymbol, logger, BFO_EXCHANGE)
 
 
 def _execute_order(client: JainamClient, tradingsymbol: str, transaction_type: str, quantity: int, live: bool) -> float:
@@ -678,7 +675,7 @@ def run(args: argparse.Namespace) -> None:
     # One state file per launch day, so a cycle carried into the next day (breakout watch / open
     # positions until the next-day exit) keeps running in its own process while the new day's
     # 10:45 cycle starts independently, instead of resuming yesterday's state.
-    global STATE_FILE, _feed
+    global STATE_FILE
     if args.state_file:
         STATE_FILE = args.state_file
     else:
@@ -686,15 +683,7 @@ def run(args: argparse.Namespace) -> None:
         STATE_FILE = f"{root}_{datetime.now(IST).date().isoformat()}{ext}"
 
     client = get_jainam_client()
-    _feed = MarketFeed.from_env()
-    _feed.start()
-    try:
-        _run_cycle(client, args)
-    finally:
-        _feed.stop()
 
-
-def _run_cycle(client: JainamClient, args: argparse.Namespace) -> None:
     state = load_state()
     if state is not None:
         live = state.get("live", False)
@@ -735,9 +724,6 @@ def _run_cycle(client: JainamClient, args: argparse.Namespace) -> None:
 
         state = run_selection_scan(client, args.lots, live, max_reentries)
 
-    for leg in state["legs"].values():
-        _feed.subscribe(BFO_EXCHANGE, leg["tradingsymbol"], client)
-
     state = run_monitoring_loop(client, state, live, max_reentries, args.poll_seconds)
 
     logger.info("Squaring off any remaining open legs for final exit.")
@@ -768,13 +754,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         "--lots", type=int, default=1, help="Number of SENSEX lots per leg (quantity = lot_size * lots). Default: 1."
     )
     parser.add_argument(
-        "--poll-seconds",
-        type=int,
-        default=2,
-        help="Seconds between monitoring-loop checks during market hours. LTP itself now comes from the "
-        "shared websocket feed (market_feed.py) rather than a REST call every tick, so this cadence is "
-        "cheap; REST is only used as a fallback when the feed is down, floored at 15s per instrument "
-        "regardless of this value. Default: 2.",
+        "--poll-seconds", type=int, default=15, help="Seconds between LTP polls during market hours. Default: 15."
     )
     parser.add_argument(
         "--max-reentries",

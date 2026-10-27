@@ -505,17 +505,6 @@ class JainamClient:
             result[key] = {"last_price": float(q["LastTradedPrice"]), "depth": {}}
         return result
 
-    def resolve_key(self, exchange: str, tradingsymbol: str) -> dict:
-        """Already-resolved {"segment": int, "id": int} for an instrument instruments()/
-        quote() has already looked up. Raises BrokerError if not yet resolved -- callers
-        (e.g. market_feed.py's subscribe()) must have gone through instruments() for this
-        exchange first, same precondition place_order() already relies on."""
-        key = f"{exchange}:{tradingsymbol}"
-        entry = self._symbol_map.get(key)
-        if entry is None:
-            raise BrokerError(f"No resolved instrument for {key} -- call instruments()/quote() for it first.")
-        return dict(entry)
-
     def ltp(self, keys: list[str]) -> dict:
         quotes = self.quote(keys)
         missing = [key for key in keys if key not in quotes]
