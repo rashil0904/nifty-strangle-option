@@ -14,6 +14,9 @@ strategy_log.txt
 .kite_session.json
 
 .jainam_session.json*
+.jainam_feed_owner.json*
+.jainam_feed_cache.json*
+.jainam_feed_subs/
 
 # Archived paper-trading runs
 paper_archive/
