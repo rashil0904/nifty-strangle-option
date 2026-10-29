@@ -654,6 +654,44 @@ def handle_stop_loss(
     return record_stop_loss(logger, leg_key, leg, quantity, exit_price, live=live)
 
 
+PROFIT_TARGET_FRACTION = 0.10  # book profit once LTP <= entry * this (90% of premium captured)
+
+
+def handle_profit_target(
+    client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict, quantity: int, live: bool, exchange: str
+) -> dict:
+    """Buy back a short that has captured 90% of its premium; the leg then stays flat (target_hit) for the
+    rest of the cycle. Any resting broker stop is cancelled first (or recognised as already filled, in
+    which case no second BUY is sent)."""
+    if live and cancel_stop(client, logger, leg_key, leg, quantity):
+        return leg
+    exit_price = execute_order(client, logger, leg["tradingsymbol"], "BUY", quantity, live, exchange)
+    pnl = (leg["entry_price"] - exit_price) * quantity
+    leg["realized_pnl"] = leg.get("realized_pnl", 0.0) + pnl
+    leg["status"] = "target_hit"
+    leg.setdefault("history", []).append(
+        {
+            "type": "profit_target",
+            "tradingsymbol": leg["tradingsymbol"],
+            "exit_price": exit_price,
+            "entry_price_at_target": leg["entry_price"],
+            "pnl": pnl,
+            "timestamp": datetime.now(IST).isoformat(),
+        }
+    )
+    logger.info(
+        "PROFIT TARGET: %s %s bought back @ %.2f (entry was %.2f, segment P&L %+.2f). Staying flat for the rest of this cycle.",
+        leg_key, leg["tradingsymbol"], exit_price, leg["entry_price"], pnl,
+    )
+    telegram_notify.send(
+        f"[{'LIVE' if live else 'PAPER'}] [{logger.name}] PROFIT TARGET\n"
+        f"{leg_key.upper()}: {leg['tradingsymbol']}\n"
+        f"Bought back @ {exit_price:.2f} (entry was {leg['entry_price']:.2f}, P&L {pnl:+.2f})",
+        logger,
+    )
+    return leg
+
+
 def handle_reentry(
     client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict, quantity: int, live: bool, exchange: str
 ) -> dict:
@@ -725,6 +763,8 @@ def apply_stop_loss_or_reentry(
             resting and ltp >= trigger * SOFTWARE_FALLBACK_BUFFER
         ):
             leg = handle_stop_loss(client, logger, leg_key, leg, quantity, live, exchange)
+        elif ltp <= leg["entry_price"] * PROFIT_TARGET_FRACTION:
+            leg = handle_profit_target(client, logger, leg_key, leg, quantity, live, exchange)
     elif leg["status"] == "watching_for_reentry":
         reentry_count = leg.get("reentry_count", 0)
         at_cap = max_reentries is not None and reentry_count >= max_reentries

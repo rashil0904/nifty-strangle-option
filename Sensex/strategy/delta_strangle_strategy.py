@@ -585,7 +585,7 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
                 )
                 leg["status"] = "error"
                 leg["error"] = str(exc)
-        elif leg["status"] in ("watching_for_reentry", "capped_flat"):
+        elif leg["status"] in ("watching_for_reentry", "capped_flat", "target_hit"):
             logger.info(
                 "%s (%s) ended the cycle flat -- no position, no action needed.", leg_key, leg["tradingsymbol"]
             )
