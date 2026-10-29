@@ -30,7 +30,7 @@ Strategy summary
 
 4. Stop-loss / re-entry (identical mechanics to delta_strangle_strategy.py,
    different thresholds/timing): once a leg is open, a stop-loss at
-   entry_price * 1.30 buys it back and starts watching for re-entry; while
+   entry_price * 1.35 buys it back and starts watching for re-entry; while
    watching, the leg re-enters (SELL) once (--max-reentries, default 1) as
    soon as LTP <= entry_price -- no upper bound, no percentage band. After
    the cap is used, a further stop-out leaves the leg flat for the rest of
@@ -189,7 +189,7 @@ SAME_DAY_EXPIRY = False  # set by --same-day-expiry
 
 TARGET_DELTA_CALL = 0.30
 TARGET_DELTA_PUT = -0.30
-STOP_LOSS_MULTIPLIER = 1.30
+STOP_LOSS_MULTIPLIER = 1.35
 # Re-entry has no multiplier: it fires as soon as LTP <= entry_price (see
 # docstring point 1). Compared directly against leg["entry_price"] in monitor_leg below.
 
@@ -494,7 +494,7 @@ def monitor_leg(
       breakout, keep watching the same frozen low on later days until the exit deadline.
     - open / watching_for_reentry: identical stop-loss / re-entry mechanics
       to delta_strangle_strategy.py, just parameterized with
-      STOP_LOSS_MULTIPLIER=1.30 here.
+      STOP_LOSS_MULTIPLIER=1.35 here.
 
     An order failure here is caught, logged CRITICAL, and halts only this
     leg (status -> "error") rather than crashing the whole process or the

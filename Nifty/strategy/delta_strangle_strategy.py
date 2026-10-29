@@ -13,7 +13,7 @@ and SELL 1 lot each of the call strike closest to +0.30 delta and the put
 strike closest to -0.30 delta. Each leg is then monitored independently
 until 10:30 IST the next trading day:
 
-  - Stop-loss: if a leg's LTP reaches entry_price * 1.20, buy it back
+  - Stop-loss: if a leg's LTP reaches entry_price * 1.25, buy it back
     immediately and start watching for a re-entry.
   - Re-entry: while flat and watching, if LTP falls back to at/near the
     original entry_price, sell it again at market. Capped at --max-reentries
@@ -172,7 +172,7 @@ SAME_DAY_EXPIRY = False  # set by --same-day-expiry
 
 TARGET_DELTA_CALL = 0.30
 TARGET_DELTA_PUT = -0.30
-STOP_LOSS_MULTIPLIER = 1.20
+STOP_LOSS_MULTIPLIER = 1.25
 # Re-entry has no multiplier: it fires as soon as LTP <= entry_price (see
 # docstring point 1). Compared directly against leg["entry_price"] in monitor_leg below.
 
