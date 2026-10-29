@@ -20,3 +20,7 @@ paper_archive/
 cron_*.log
 supervisor_*.txt
 supervisor_memory.json
+logs/
+
+# Claude Code's own local project settings -- not source
+.claude/
