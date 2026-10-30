@@ -11,6 +11,7 @@ strategy_log.txt
 
 # Local environment / credentials -- never commit these
 .env
+.env.bak*
 .kite_session.json
 
 .jainam_session.json*
