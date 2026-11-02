@@ -25,3 +25,8 @@ logs/
 
 # Claude Code's own local project settings -- not source
 .claude/
+
+# Live snapshot of in-progress legs (results/trade_history.py) -- current run
+# state, not history; results/trade_history.json (the permanent ledger) is
+# tracked in git, this is not.
+results/open_positions.json

@@ -40,6 +40,7 @@ from typing import Optional
 from jainam_client import JainamClient
 from broker_errors import BrokerAuthError, BrokerError
 import telegram_notify
+from results import trade_history as _results_trade_history
 
 try:
     from zoneinfo import ZoneInfo
@@ -408,6 +409,10 @@ def record_stop_loss(
         f"Now watching for re-entry <= {leg['entry_price']:.2f}",
         logger,
     )
+    try:
+        _results_trade_history.write_open_position_snapshot(logger.name, leg_key, leg, quantity)
+    except Exception:
+        logger.exception("Failed to write open-position snapshot for %s -- continuing.", leg_key)
     return leg
 
 
@@ -689,6 +694,10 @@ def handle_profit_target(
         f"Bought back @ {exit_price:.2f} (entry was {leg['entry_price']:.2f}, P&L {pnl:+.2f})",
         logger,
     )
+    try:
+        _results_trade_history.write_open_position_snapshot(logger.name, leg_key, leg, quantity)
+    except Exception:
+        logger.exception("Failed to write open-position snapshot for %s -- continuing.", leg_key)
     return leg
 
 
@@ -725,6 +734,10 @@ def book_reentry(logger: logging.Logger, leg_key: str, leg: dict, quantity: int,
         f"Sold @ {new_entry_price:.2f}",
         logger,
     )
+    try:
+        _results_trade_history.write_open_position_snapshot(logger.name, leg_key, leg, quantity)
+    except Exception:
+        logger.exception("Failed to write open-position snapshot for %s -- continuing.", leg_key)
     return leg
 
 

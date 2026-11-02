@@ -376,6 +376,10 @@ def place_entry(client: JainamClient, leg_key: str, leg_selection: dict, quantit
         f"Sold @ {entry_price:.2f} x{quantity}",
         logger,
     )
+    try:
+        _results_trade_history.write_open_position_snapshot(logger.name, leg_key, leg_state, quantity)
+    except Exception:
+        logger.exception("Failed to write open-position snapshot for %s -- continuing.", leg_key)
     return leg_state
 
 
@@ -622,6 +626,10 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
                 _results_trade_history.append_closed_leg(STRATEGY_NAME, leg_key, leg, quantity, state["lots"])
             except Exception:
                 logger.exception("Failed to append %s leg to results/trade_history.json -- continuing.", leg_key)
+        try:
+            _results_trade_history.remove_open_position(logger.name, leg_key)
+        except Exception:
+            logger.exception("Failed to remove %s leg from open_positions.json -- continuing.", leg_key)
 
     try:
         _results_build_pnl.main()
