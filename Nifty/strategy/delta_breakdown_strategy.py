@@ -129,8 +129,12 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "helpers"))
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "..", "common"))
 
+sys.path.insert(0, os.path.join(_THIS_DIR, "..", ".."))
+
 from jainam_client import JainamClient
 import telegram_notify
+from results import trade_history as _results_trade_history
+from results import build_pnl as _results_build_pnl
 from nifty_delta_model import (
     IST,
     NFO_EXCHANGE,
@@ -176,6 +180,8 @@ from leg_lifecycle import (
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
+
+STRATEGY_NAME = "Nifty Breakdown"
 
 STATE_FILE = "breakdown_strategy_state.json"
 LOG_FILE = "breakdown_strategy_log.txt"
@@ -705,6 +711,17 @@ def exit_all(client: JainamClient, state: dict, live: bool) -> dict:
             "%s SUMMARY: stop_outs=%d re-entries=%d total_realized_pnl=%+.2f",
             leg_key, leg.get("stop_count", 0), leg.get("reentry_count", 0), leg.get("realized_pnl", 0.0),
         )
+
+        if leg.get("entry_price") is not None:
+            try:
+                _results_trade_history.append_closed_leg(STRATEGY_NAME, leg_key, leg, quantity, state["lots"])
+            except Exception:
+                logger.exception("Failed to append %s leg to results/trade_history.json -- continuing.", leg_key)
+
+    try:
+        _results_build_pnl.main()
+    except Exception:
+        logger.exception("Failed to rebuild/push results/nifty-strangle-options-pnl.xlsx -- continuing.")
 
     save_state(state)
     return state
