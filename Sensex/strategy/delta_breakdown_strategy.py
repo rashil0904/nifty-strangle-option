@@ -150,6 +150,7 @@ from sensex_delta_model import (
     black76_delta,
     implied_vol,
 )
+from synthetic_forward import synthetic_forward
 import leg_lifecycle as _leg_lifecycle
 from leg_lifecycle import (
     MARKET_CLOSE_TIME,
@@ -286,7 +287,7 @@ def _execute_order(client: JainamClient, tradingsymbol: str, transaction_type: s
 
 
 def select_entry_strikes(client: JainamClient, instruments: pd.DataFrame) -> dict:
-    """Nearest weekly SENSEX expiry -> option chain + futures price -> Black-76
+    """Nearest weekly SENSEX expiry -> option chain -> synthetic forward (K + C - P, futures as fallback) -> Black-76
     delta per strike/side -> the call closest to +0.30 delta and the put
     closest to -0.30 delta (by absolute difference). Identical selection
     method to delta_strangle_strategy.py, but this is an entirely separate
@@ -307,13 +308,24 @@ def select_entry_strikes(client: JainamClient, instruments: pd.DataFrame) -> dic
     )
     T = time_to_expiry_years(expiry)
 
+    # The nearest future is the monthly contract; its carry overstates the forward for a weekly expiry.
+    forward = synthetic_forward(chain, spot)
+    if forward is None:
+        logger.warning(
+            "Too few strikes priced on both sides near spot %.2f for a synthetic forward -- falling back to futures %.2f.",
+            spot, futures_price,
+        )
+        forward = futures_price
+    else:
+        logger.info("Pricing off synthetic forward %.2f (futures %.2f, spot %.2f).", forward, futures_price, spot)
+
     chain = chain.copy()
     chain["delta"] = np.nan
     for idx, row in chain.iterrows():
         strike, side, price = row["strike"], row["instrument_type"], row["price"]
-        iv = implied_vol(lambda s, K=strike, opt=side: black76_price(futures_price, K, T, DEFAULT_R, s, opt), price)
+        iv = implied_vol(lambda s, K=strike, opt=side: black76_price(forward, K, T, DEFAULT_R, s, opt), price)
         if np.isfinite(iv):
-            chain.at[idx, "delta"] = black76_delta(futures_price, strike, T, DEFAULT_R, iv, side)
+            chain.at[idx, "delta"] = black76_delta(forward, strike, T, DEFAULT_R, iv, side)
 
     calls = chain[chain["instrument_type"] == "CE"].dropna(subset=["delta"])
     puts = chain[chain["instrument_type"] == "PE"].dropna(subset=["delta"])
