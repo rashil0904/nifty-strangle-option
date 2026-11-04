@@ -363,6 +363,7 @@ def arm_stop(
         )
     except BrokerError as exc:
         leg["sl_arm_failures"] = leg.get("sl_arm_failures", 0) + 1
+        leg["sl_last_error"] = str(exc)[:300]
         logger.warning(
             "Could not place resting stop for %s %s @ %.2f (failure %d/%d): %s -- software stop remains active.",
             leg_key, leg["tradingsymbol"], trigger, leg["sl_arm_failures"], MAX_STOP_ARM_FAILURES, exc,
@@ -455,7 +456,7 @@ def check_broker_stop(client: JainamClient, logger: logging.Logger, leg_key: str
         leg["sl_order_id"] = None
         record_stop_loss(logger, leg_key, leg, quantity, float(latest["average_price"]), live=True)
         return True
-    if status in ("REJECTED", "CANCELLED"):
+    if status in ("REJECTED", "CANCELLED", "EXPIRED"):
         leg["sl_order_id"] = None
         if status == "REJECTED":
             leg["sl_arm_failures"] = leg.get("sl_arm_failures", 0) + 1
@@ -465,6 +466,83 @@ def check_broker_stop(client: JainamClient, logger: logging.Logger, leg_key: str
             "will be re-placed" if status == "CANCELLED" else "software stop covers it",
         )
     return False
+
+
+
+# --------------------------------------------------------------------------
+# Pre-open stop arming. The DAY stop of a carried-over leg expires at the close, so the bot wakes at
+# PREOPEN_START_TIME (not at the open) and tries to park the stop straight away, retrying every
+# PREOPEN_RETRY_SECONDS. If the broker rejects stops before the open (most Indian brokers do), the
+# attempts just fail harmlessly and the normal at-open arming takes over; the first outcome of the day
+# is sent to Telegram so it is known whether Jainam accepts pre-open stops.
+# --------------------------------------------------------------------------
+
+PREOPEN_START_TIME = dtime(9, 0)
+PREOPEN_RETRY_SECONDS = 60
+
+
+def preopen_arm_stops(
+    client: JainamClient,
+    logger: logging.Logger,
+    state: dict,
+    quantity: int,
+    live: bool,
+    multiplier: float,
+    exchange: str,
+    now: datetime,
+    label: str,
+) -> Optional[datetime]:
+    """Call when outside market hours. Returns the time the caller should sleep until, or None when this is
+    not a pre-open situation (the caller then sleeps to the open as before). Never raises: any failure
+    here must leave the at-open arming to do the job."""
+    if not live or not is_trading_day(now.date()):
+        return None
+    open_legs = [(k, leg) for k, leg in state["legs"].items() if leg["status"] == "open"]
+    if not open_legs or now.time() >= MARKET_OPEN_TIME:
+        return None
+    preopen_start = datetime.combine(now.date(), PREOPEN_START_TIME, tzinfo=IST)
+    if now < preopen_start:
+        return preopen_start
+    open_time = datetime.combine(now.date(), MARKET_OPEN_TIME, tzinfo=IST)
+    all_armed = True
+    for leg_key, leg in open_legs:
+        try:
+            check_broker_stop(client, logger, leg_key, leg, quantity)  # forgets yesterday's expired DAY stop
+            if leg["status"] != "open":
+                continue
+            if not leg.get("sl_order_id"):
+                failures = leg.get("sl_arm_failures", 0)
+                leg["sl_arm_failures"] = 0
+                arm_stop(client, logger, leg_key, leg, leg["entry_price"], quantity, live, multiplier, exchange, )
+                if not leg.get("sl_order_id"):
+                    # pre-open rejections must not use up the retries reserved for the open
+                    leg["sl_arm_failures"] = failures
+            if leg.get("sl_order_id"):
+                if not leg.get("preopen_stop_reported") and leg.get("sl_placed_at", "")[:10] == now.date().isoformat():
+                    leg["preopen_stop_reported"] = True
+                    logger.info("PRE-OPEN: stop for %s ACCEPTED at %s.", leg_key, now.time().isoformat(timespec="seconds"))
+                    telegram_notify.send(
+                        f"[{label}] PRE-OPEN stop ACCEPTED for {leg_key.upper()} {leg['tradingsymbol']} at "
+                        f"{now:%H:%M:%S} (trigger {leg.get('sl_price')}). Jainam takes stops before 9:15.",
+                        logger,
+                    )
+            else:
+                all_armed = False
+                if not leg.get("preopen_reject_reported"):
+                    leg["preopen_reject_reported"] = True
+                    logger.warning("PRE-OPEN: stop for %s not accepted: %s", leg_key, leg.get("sl_last_error"))
+                    telegram_notify.send(
+                        f"[{label}] PRE-OPEN stop NOT accepted for {leg_key.upper()} {leg['tradingsymbol']} at "
+                        f"{now:%H:%M:%S}: {leg.get('sl_last_error')}. Will retry every {PREOPEN_RETRY_SECONDS}s and "
+                        f"arm at the open.",
+                        logger,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            all_armed = False
+            logger.warning("PRE-OPEN stop attempt for %s failed unexpectedly: %s", leg_key, exc)
+    if all_armed:
+        return open_time
+    return min(now + timedelta(seconds=PREOPEN_RETRY_SECONDS), open_time)
 
 
 def cancel_stop(client: JainamClient, logger: logging.Logger, leg_key: str, leg: dict, quantity: int) -> bool:

@@ -157,6 +157,7 @@ from leg_lifecycle import (
     clear_state as _lifecycle_clear_state,
     is_trading_day,
     is_market_hours,
+    preopen_arm_stops,
     next_market_open,
     deadline_next_trading_day,
     sleep_until,
@@ -617,7 +618,12 @@ def run_monitoring_loop(
             break
 
         if not is_market_hours(now):
-            sleep_target = min(next_market_open(now), exit_deadline)
+            preopen_wake = preopen_arm_stops(
+                client, logger, state, quantity, live, STOP_LOSS_MULTIPLIER, NFO_EXCHANGE, now, "LIVE] [NIFTY BREAKDOWN"
+            )
+            if preopen_wake is not None:
+                save_state(state)
+            sleep_target = min(preopen_wake or next_market_open(now), exit_deadline)
             logger.info("Outside market hours -- sleeping until %s.", sleep_target.isoformat())
             sleep_until(sleep_target)
             continue

@@ -34,6 +34,7 @@ import sys
 from datetime import datetime, time, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)  # for the `results` package imported by common/leg_lifecycle.py
 sys.path.insert(0, os.path.join(ROOT, "common"))
 
 import telegram_notify  # noqa: E402
