@@ -105,12 +105,23 @@ def append_closed_leg(strategy: str, leg_key: str, leg: dict, quantity: int, lot
 
 
 def load_trade_history() -> list[dict]:
+    """Every archived leg, oldest first. A leg closed by hand mid-cycle is archived at that moment and
+    again by its strategy's exit_all() at the deadline; the second copy is dropped here."""
     if not HISTORY_PATH.exists():
         return []
     try:
-        return json.loads(HISTORY_PATH.read_text())
+        history = json.loads(HISTORY_PATH.read_text())
     except (json.JSONDecodeError, OSError):
         return []
+    seen = set()
+    unique = []
+    for rec in history:
+        key = (rec.get("strategy"), rec.get("leg_key"), rec.get("tradingsymbol"), rec.get("entry_date"), rec.get("entry_price"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(rec)
+    return unique
 
 
 def _read_open_positions() -> dict:

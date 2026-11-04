@@ -37,15 +37,6 @@ xlsx upload). Never pushed if the build itself failed, and a push failure
 (rclone not installed, remote not configured, network) only warns --
 never raises past main().
 
-A third sheet, "Open Positions", shows every leg still mid-cycle (not yet
-archived to Trade Log) -- built from results/trade_history.json's
-companion open_positions.json, written by write_open_position_snapshot()
-at every entry/stop-loss/profit-target/re-entry, not just at the final
-close. No TRACK_SINCE filtering there (it's current state, not history),
-and its Status column can show a flat state (watching_for_reentry,
-capped_flat, target_hit) between events -- the leg is still mid-cycle
-until exit_all() removes it, not necessarily holding a position right now.
-
 There's deliberately no cron here -- this is called from inside
 common/leg_lifecycle.py's shared event functions and each strategy
 script's own place_entry()/exit_all(), every one of those wrapped in a
@@ -68,7 +59,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import CellIsRule, FormulaRule, DataBarRule
 
-from results.trade_history import load_trade_history, load_open_positions
+from results.trade_history import load_trade_history
 
 RESULTS_DIR = Path(__file__).resolve().parent
 OUT_PATH = RESULTS_DIR / "nifty-strangle-options-pnl.xlsx"
@@ -192,59 +183,6 @@ def build_trade_log(ws, trades: list[dict]) -> int:
 
     ws.freeze_panes = "C4"
     return last_row
-
-
-# ── Open Positions (live, mid-cycle legs) ───────────────────────────────────
-OP_FIRST_ROW = 4
-OP_HEADERS = [
-    "Strategy", "Leg", "Tradingsymbol", "Strike", "Option Type",
-    "Entry Price", "Status", "Stop Count", "Re-entry Count",
-    "Realized P&L (so far)", "Quantity", "Updated At",
-]
-
-
-def build_open_positions_sheet(ws, positions: dict) -> None:
-    """positions is results.trade_history.load_open_positions()'s {strategy: {leg_key: {...}}}
-    shape -- flattened here to one row per leg, newest-updated strategy first isn't worth
-    sorting for, so this just walks STRATEGIES in a fixed, familiar order."""
-    set_title_subtitle(
-        ws, "Open Positions",
-        "Every leg still mid-cycle right now (not yet archived to Trade Log) -- refreshed on "
-        "every entry/stop-loss/profit-target/re-entry, not just the final exit. A flat status "
-        "(watching_for_reentry/capped_flat/target_hit) still means mid-cycle, not necessarily "
-        "holding a position this instant.",
-        len(OP_HEADERS),
-    )
-
-    for col, header in enumerate(OP_HEADERS, start=1):
-        ws.cell(row=3, column=col, value=header)
-    style_header_row(ws, 3, len(OP_HEADERS))
-
-    widths = [16, 6, 20, 9, 11, 13, 20, 10, 13, 18, 10, 20]
-    for col, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col)].width = w
-
-    row = OP_FIRST_ROW
-    for strategy in STRATEGIES:
-        for leg_key, leg in sorted(positions.get(strategy, {}).items()):
-            values = [
-                strategy, leg_key, leg.get("tradingsymbol"), leg.get("strike"), leg.get("option_type"),
-                leg.get("entry_price"), leg.get("status"), leg.get("stop_count"), leg.get("reentry_count"),
-                leg.get("realized_pnl"), leg.get("quantity"), leg.get("updated_at"),
-            ]
-            for col, val in enumerate(values, start=1):
-                ws.cell(row=row, column=col, value=val)
-            price_cell = ws.cell(row=row, column=6)
-            price_cell.number_format = PRICE
-            pnl_cell = ws.cell(row=row, column=10)
-            pnl_cell.number_format = INR
-            if isinstance(leg.get("realized_pnl"), (int, float)) and leg["realized_pnl"] < 0:
-                pnl_cell.font = RED_FONT
-            row += 1
-
-    if row > OP_FIRST_ROW:
-        ws.auto_filter.ref = f"A3:L{row - 1}"
-    ws.freeze_panes = "C4"
 
 
 # ── Total PnL (dashboard) ────────────────────────────────────────────────────
@@ -437,17 +375,13 @@ def main(out_path: Path = OUT_PATH) -> None:
     trades = [t for t in all_trades if t.get("entry_date") and date.fromisoformat(t["entry_date"]) >= TRACK_SINCE]
     skipped = len(all_trades) - len(trades)
 
-    open_positions = load_open_positions()
-
     wb = Workbook()
     ws_total = wb.active
     ws_total.title = "Total PnL"
     ws_log = wb.create_sheet("Trade Log")
-    ws_open = wb.create_sheet("Open Positions")
 
     tl_last_row = build_trade_log(ws_log, trades)
     build_total_pnl_dashboard(ws_total, tl_last_row)
-    build_open_positions_sheet(ws_open, open_positions)
 
     for ws in wb.worksheets:
         ws.sheet_view.showGridLines = False
