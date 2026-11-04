@@ -375,10 +375,6 @@ def place_entry(client: JainamClient, leg_key: str, leg_selection: dict, quantit
         f"Sold @ {entry_price:.2f} x{quantity}",
         logger,
     )
-    try:
-        _results_trade_history.write_open_position_snapshot(logger.name, leg_key, leg_state, quantity)
-    except Exception:
-        logger.exception("Failed to write open-position snapshot for %s -- continuing.", leg_key)
     return leg_state
 
 

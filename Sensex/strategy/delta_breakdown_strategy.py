@@ -489,10 +489,6 @@ def place_entry(
         f"Sold @ {entry_price:.2f} x{quantity} (broke below frozen tracked_low {leg['tracked_low']:.2f})",
         logger,
     )
-    try:
-        _results_trade_history.write_open_position_snapshot(logger.name, leg_key, leg, quantity)
-    except Exception:
-        logger.exception("Failed to write open-position snapshot for %s -- continuing.", leg_key)
     return leg
 
 
