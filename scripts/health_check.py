@@ -60,7 +60,7 @@ STATE_GLOBS = ["strategy_state.json", "sensex_strategy_state.json",
 LOG_PATTERNS = {
     "rate_limit": (re.compile(r"HTTP 429"), RATE_LIMIT_MIN_HITS, "Jainam rate limit (HTTP 429)"),
     "ltp_fail": (re.compile(r"Could not fetch LTP"), LTP_FAIL_MIN_HITS, "price fetch failed after retries"),
-    "error": (re.compile(r" ERROR |FAILED"), 1, "ERROR / FAILED"),
+    "error": (re.compile(r" ERROR |FAILED|CRITICAL|FATAL|ended REJECTED|ended with status REJECTED"), 1, "ERROR / FAILED / CRITICAL / REJECTED"),
 }
 LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 

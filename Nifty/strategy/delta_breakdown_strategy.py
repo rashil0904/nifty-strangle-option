@@ -867,6 +867,7 @@ def main(argv: Optional[list] = None) -> int:
         return 1
     except (EnvironmentError, RuntimeError) as exc:
         logger.critical("FATAL: %s", exc)
+        telegram_notify.send(f"[FATAL] [NIFTY BREAKDOWN] process exiting: {str(exc)[:300]}", logger)
         return 1
     return 0
 
