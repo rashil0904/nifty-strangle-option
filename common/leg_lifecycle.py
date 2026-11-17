@@ -53,7 +53,7 @@ IST = ZoneInfo("Asia/Kolkata")
 # --------------------------------------------------------------------------
 
 MARKET_OPEN_TIME = dtime(9, 15)
-MARKET_CLOSE_TIME = dtime(15, 30)
+MARKET_CLOSE_TIME = dtime(15, 40)
 
 RETRYABLE_MAX_ATTEMPTS = 3
 RETRYABLE_BACKOFF_SECONDS = 2
